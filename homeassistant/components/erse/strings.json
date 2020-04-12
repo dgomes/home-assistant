@@ -12,8 +12,7 @@
       }
     },
     "error": {
-      "invalid_operator": "We cannot find such operator in our database",
-      "invalid_plan": "We cannot find such plan.",
+      "invalid_plan": "The operator you chose, does not support that plan.",
       "unknown": "Unexpected error"
     }
   }

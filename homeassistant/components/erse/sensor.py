@@ -9,12 +9,25 @@ import logging
 from electricity.tariffs import Operators
 import voluptuous as vol
 
+from homeassistant.components.utility_meter.const import (
+    ATTR_TARIFF,
+    DOMAIN as UTILITY_METER_DOMAIN,
+    SERVICE_SELECT_TARIFF,
+)
+from homeassistant.const import ATTR_ENTITY_ID
 from homeassistant.core import callback
+import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.event import async_track_time_change
 from homeassistant.util import dt as dt_util
 
-from .const import CONF_OPERATOR, CONF_PLAN, COUNTRY
+from .const import (
+    CONF_OPERATOR,
+    CONF_PLAN,
+    CONF_UTILITY_METER,
+    CONF_UTILITY_METERS,
+    COUNTRY,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,8 +41,8 @@ UTILITY_METER_NAME_FORMAT = "{} {}"
 
 PLATFORM_SCHEMA = vol.Schema(
     {
-        vol.Required("operator"): vol.In(Operators[COUNTRY].keys()),
-        vol.Required("plan"): vol.In(
+        vol.Required(CONF_OPERATOR): vol.In(Operators[COUNTRY].keys()),
+        vol.Required(CONF_PLAN): vol.In(
             list(
                 {
                     str(p)
@@ -38,6 +51,7 @@ PLATFORM_SCHEMA = vol.Schema(
                 }
             )
         ),
+        vol.Required(CONF_UTILITY_METERS): vol.All(cv.ensure_list, [cv.string]),
     }
 )
 
@@ -67,20 +81,18 @@ class EletricityEntity(Entity):
         self._name = name
         self.operator = config[CONF_OPERATOR]
         self.plan = config[CONF_PLAN]
-        self._tariffs = []
+        self.utility_meters = config[CONF_UTILITY_METER]
+        self.my_plan = Operators[COUNTRY][self.operator](plan=self.plan)
+        self._tariffs = self.my_plan.tariffs()
         self._state = None
 
     async def async_added_to_hass(self):
         """Setups all required entities and automations."""
-
-        self.my_plan = Operators[COUNTRY][self.operator](plan=self.plan)
         self._state = self.my_plan.current_tariff(dt_util.now())
-        self._tariffs = self.my_plan.tariffs()
-
         async_track_time_change(self.hass, self.timer_update, minute=range(0, 60, 15))
 
     @callback
-    def timer_update(self, now):
+    async def timer_update(self, now):
         """Change tariff based on timer."""
 
         new_state = self.my_plan.current_tariff(now)
@@ -88,7 +100,15 @@ class EletricityEntity(Entity):
         if new_state != self._state:
             _LOGGER.debug("Changing from %s to %s", self._state, new_state)
             self._state = new_state
-            self.schedule_update_ha_state()
+
+            await self.async_update_ha_state()
+
+            for utility_meter in self.utility_meters:
+                await self.hass.services.async_call(
+                    UTILITY_METER_DOMAIN,
+                    SERVICE_SELECT_TARIFF,
+                    {ATTR_ENTITY_ID: utility_meter, ATTR_TARIFF: self._state},
+                )
 
     @property
     def should_poll(self):
