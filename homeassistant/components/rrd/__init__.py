@@ -11,49 +11,25 @@ from homeassistant.const import CONF_NAME, CONF_PATH, EVENT_STATE_CHANGED
 from homeassistant.helpers import state as state_helper
 import homeassistant.helpers.config_validation as cv
 
-from .const import DOMAIN
-
-CONF_TOLERANCE = "tolerance"
-CONF_DBS = "databases"
-
-CONF_DS = "data_sources"
-CONF_SENSOR = "sensor"
-CONF_STEP = "step"
-CONF_CF = "cf"
-CONF_HEARTBEAT = "heartbeat"
-CONF_MIN = "min"
-CONF_MAX = "max"
-
-CONF_RRA = "round_robin_archives"
-CONF_XFF = "xff"
-CONF_STEPS = "steps"
-CONF_ROWS = "rows"
-
-DEFAULT_STEP = "5m"
-
-RRD_DIR = "rrd"
-
-
-def rrd_scaled_duration(duration):
-    """Validate according to https://oss.oetiker.ch/rrdtool/doc/librrd.en.html#rrd_scaled_duration_(const_char_*_token,_unsigned_long_divisor,_unsigned_long_*_valuep)."""
-
-    if isinstance(duration, int):
-        # We assume duration is in seconds (RRD original behaviour)
-        return duration
-
-    scaling_factor = duration[-1]
-    if scaling_factor not in ["s", "m", "h", "d", "w", "M", "y"]:
-        raise vol.Invalid("Must use a scaling factor with your number")
-
-    try:
-        number = int(duration[0:-1])
-        if number <= 0:
-            raise vol.Invalid("Duration must be positive")
-    except Exception:
-        raise vol.Invalid("Duration must be a number.")
-
-    return duration
-
+from .const import (
+    CONF_CF,
+    CONF_DBS,
+    CONF_DS,
+    CONF_HEARTBEAT,
+    CONF_MAX,
+    CONF_MIN,
+    CONF_ROWS,
+    CONF_RRA,
+    CONF_SENSOR,
+    CONF_STEP,
+    CONF_STEPS,
+    CONF_TOLERANCE,
+    CONF_XFF,
+    DEFAULT_STEP,
+    DOMAIN,
+    RRD_DIR,
+)
+from .utils import rrd_scaled_duration
 
 DS_SCHEMA = vol.Schema(
     {
