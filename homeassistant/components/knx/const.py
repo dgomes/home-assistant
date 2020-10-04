@@ -15,7 +15,6 @@ from homeassistant.components.climate.const import (
 )
 
 DOMAIN = "knx"
-DATA_KNX = "data_knx"
 
 CONF_STATE_ADDRESS = "state_address"
 CONF_SYNC_STATE = "sync_state"
@@ -28,8 +27,8 @@ class ColorTempModes(Enum):
     relative = "DPT-5.001"
 
 
-class DeviceTypes(Enum):
-    """KNX device types."""
+class SupportedPlatforms(Enum):
+    """Supported platforms."""
 
     cover = "cover"
     light = "light"
@@ -39,6 +38,7 @@ class DeviceTypes(Enum):
     notify = "notify"
     scene = "scene"
     sensor = "sensor"
+    weather = "weather"
 
 
 # Map KNX operation modes to HA modes. This list might not be complete.
@@ -59,3 +59,5 @@ PRESET_MODES = {
     "Standby": PRESET_AWAY,
     "Comfort": PRESET_COMFORT,
 }
+
+ATTR_COUNTER = "counter"

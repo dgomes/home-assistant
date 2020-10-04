@@ -35,7 +35,7 @@ from homeassistant.helpers.typing import ConfigType
 import homeassistant.util.dt as dt_util
 
 from . import migration, purge
-from .const import DATA_INSTANCE, DOMAIN, SQLITE_URL_PREFIX
+from .const import CONF_DB_INTEGRITY_CHECK, DATA_INSTANCE, DOMAIN, SQLITE_URL_PREFIX
 from .models import Base, Events, RecorderRuns, States
 from .util import session_scope, validate_or_move_away_sqlite_database
 
@@ -55,6 +55,7 @@ SERVICE_PURGE_SCHEMA = vol.Schema(
 
 DEFAULT_URL = "sqlite:///{hass_config_path}"
 DEFAULT_DB_FILE = "home-assistant_v2.db"
+DEFAULT_DB_INTEGRITY_CHECK = True
 DEFAULT_DB_MAX_RETRIES = 10
 DEFAULT_DB_RETRY_WAIT = 3
 KEEPALIVE_TIME = 30
@@ -99,6 +100,9 @@ CONFIG_SCHEMA = vol.Schema(
                     vol.Optional(
                         CONF_DB_RETRY_WAIT, default=DEFAULT_DB_RETRY_WAIT
                     ): cv.positive_int,
+                    vol.Optional(
+                        CONF_DB_INTEGRITY_CHECK, default=DEFAULT_DB_INTEGRITY_CHECK
+                    ): cv.boolean,
                 }
             ),
         )
@@ -156,6 +160,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     commit_interval = conf[CONF_COMMIT_INTERVAL]
     db_max_retries = conf[CONF_DB_MAX_RETRIES]
     db_retry_wait = conf[CONF_DB_RETRY_WAIT]
+    db_integrity_check = conf[CONF_DB_INTEGRITY_CHECK]
 
     db_url = conf.get(CONF_DB_URL)
     if not db_url:
@@ -172,6 +177,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         db_retry_wait=db_retry_wait,
         entity_filter=entity_filter,
         exclude_t=exclude_t,
+        db_integrity_check=db_integrity_check,
     )
     instance.async_initialize()
     instance.start()
@@ -190,6 +196,10 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 PurgeTask = namedtuple("PurgeTask", ["keep_days", "repack"])
 
 
+class WaitTask:
+    """An object to insert into the recorder queue to tell it set the _queue_watch event."""
+
+
 class Recorder(threading.Thread):
     """A threaded recorder class."""
 
@@ -204,6 +214,7 @@ class Recorder(threading.Thread):
         db_retry_wait: int,
         entity_filter: Callable[[str], bool],
         exclude_t: List[str],
+        db_integrity_check: bool,
     ) -> None:
         """Initialize the recorder."""
         threading.Thread.__init__(self, name="Recorder")
@@ -217,7 +228,9 @@ class Recorder(threading.Thread):
         self.db_url = uri
         self.db_max_retries = db_max_retries
         self.db_retry_wait = db_retry_wait
+        self.db_integrity_check = db_integrity_check
         self.async_db_ready = asyncio.Future()
+        self._queue_watch = threading.Event()
         self.engine: Any = None
         self.run_info: Any = None
 
@@ -226,7 +239,7 @@ class Recorder(threading.Thread):
 
         self._timechanges_seen = 0
         self._keepalive_count = 0
-        self._old_state_ids = {}
+        self._old_states = {}
         self.event_session = None
         self.get_session = None
         self._completed_database_setup = False
@@ -345,6 +358,9 @@ class Recorder(threading.Thread):
                 if not purge.purge_old_data(self, event.keep_days, event.repack):
                     self.queue.put(PurgeTask(event.keep_days, event.repack))
                 continue
+            if isinstance(event, WaitTask):
+                self._queue_watch.set()
+                continue
             if event.event_type == EVENT_TIME_CHANGED:
                 self._keepalive_count += 1
                 if self._keepalive_count >= KEEPALIVE_TIME:
@@ -369,7 +385,6 @@ class Recorder(threading.Thread):
                 if event.event_type == EVENT_STATE_CHANGED:
                     dbevent.event_data = "{}"
                 self.event_session.add(dbevent)
-                self.event_session.flush()
             except (TypeError, ValueError):
                 _LOGGER.warning("Event is not JSON serializable: %s", event)
             except Exception as err:  # pylint: disable=broad-except
@@ -380,16 +395,14 @@ class Recorder(threading.Thread):
                 try:
                     dbstate = States.from_event(event)
                     has_new_state = event.data.get("new_state")
-                    dbstate.old_state_id = self._old_state_ids.get(dbstate.entity_id)
+                    if dbstate.entity_id in self._old_states:
+                        dbstate.old_state = self._old_states.pop(dbstate.entity_id)
                     if not has_new_state:
                         dbstate.state = None
-                    dbstate.event_id = dbevent.event_id
+                    dbstate.event = dbevent
                     self.event_session.add(dbstate)
-                    self.event_session.flush()
                     if has_new_state:
-                        self._old_state_ids[dbstate.entity_id] = dbstate.state_id
-                    elif dbstate.entity_id in self._old_state_ids:
-                        del self._old_state_ids[dbstate.entity_id]
+                        self._old_states[dbstate.entity_id] = dbstate
                 except (TypeError, ValueError):
                     _LOGGER.warning(
                         "State is not JSON serializable: %s",
@@ -498,8 +511,9 @@ class Recorder(threading.Thread):
         after calling this to ensure the data
         is in the database.
         """
-        while not self.queue.empty():
-            time.sleep(0.025)
+        self._queue_watch.clear()
+        self.queue.put(WaitTask())
+        self._queue_watch.wait()
 
     def _setup_connection(self):
         """Ensure database is ready to fly."""
@@ -547,7 +561,9 @@ class Recorder(threading.Thread):
                 # On systems with very large databases and
                 # very slow disk or cpus, this can take a while.
                 #
-                validate_or_move_away_sqlite_database(self.db_url)
+                validate_or_move_away_sqlite_database(
+                    self.db_url, self.db_integrity_check
+                )
 
         if self.engine is not None:
             self.engine.dispose()
@@ -557,7 +573,9 @@ class Recorder(threading.Thread):
         sqlalchemy_event.listen(self.engine, "connect", setup_recorder_connection)
 
         Base.metadata.create_all(self.engine)
-        self.get_session = scoped_session(sessionmaker(bind=self.engine))
+        self.get_session = scoped_session(
+            sessionmaker(bind=self.engine, expire_on_commit=False)
+        )
 
     def _close_connection(self):
         """Close the connection."""

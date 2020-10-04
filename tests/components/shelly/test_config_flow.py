@@ -1,6 +1,8 @@
 """Test the Shelly config flow."""
 import asyncio
 
+import aiohttp
+import aioshelly
 import pytest
 
 from homeassistant import config_entries, setup
@@ -24,9 +26,11 @@ async def test_form(hass):
         return_value={"mac": "test-mac", "type": "SHSW-1", "auth": False},
     ), patch(
         "aioshelly.Device.create",
-        return_value=Mock(
-            shutdown=AsyncMock(),
-            settings={"name": "Test name", "device": {"mac": "test-mac"}},
+        new=AsyncMock(
+            return_value=Mock(
+                shutdown=AsyncMock(),
+                settings={"name": "Test name", "device": {"mac": "test-mac"}},
+            )
         ),
     ), patch(
         "homeassistant.components.shelly.async_setup", return_value=True
@@ -50,7 +54,7 @@ async def test_form(hass):
 
 
 async def test_form_auth(hass):
-    """Test we can't manually configure if auth is required."""
+    """Test manual configuration if auth is required."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
@@ -66,8 +70,38 @@ async def test_form_auth(hass):
             {"host": "1.1.1.1"},
         )
 
-    assert result2["type"] == "abort"
-    assert result2["reason"] == "auth_not_supported"
+    assert result2["type"] == "form"
+    assert result["errors"] == {}
+
+    with patch(
+        "aioshelly.Device.create",
+        new=AsyncMock(
+            return_value=Mock(
+                shutdown=AsyncMock(),
+                settings={"name": "Test name", "device": {"mac": "test-mac"}},
+            )
+        ),
+    ), patch(
+        "homeassistant.components.shelly.async_setup", return_value=True
+    ) as mock_setup, patch(
+        "homeassistant.components.shelly.async_setup_entry",
+        return_value=True,
+    ) as mock_setup_entry:
+        result3 = await hass.config_entries.flow.async_configure(
+            result2["flow_id"],
+            {"username": "test username", "password": "test password"},
+        )
+
+    assert result3["type"] == "create_entry"
+    assert result3["title"] == "Test name"
+    assert result3["data"] == {
+        "host": "1.1.1.1",
+        "username": "test username",
+        "password": "test password",
+    }
+    await hass.async_block_till_done()
+    assert len(mock_setup.mock_calls) == 1
+    assert len(mock_setup_entry.mock_calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -80,10 +114,7 @@ async def test_form_errors_get_info(hass, error):
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
 
-    with patch(
-        "aioshelly.get_info",
-        side_effect=exc,
-    ):
+    with patch("aioshelly.get_info", side_effect=exc):
         result2 = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             {"host": "1.1.1.1"},
@@ -103,10 +134,9 @@ async def test_form_errors_test_connection(hass, error):
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
 
-    with patch("aioshelly.get_info", return_value={"auth": False}), patch(
-        "aioshelly.Device.create",
-        side_effect=exc,
-    ):
+    with patch(
+        "aioshelly.get_info", return_value={"mac": "test-mac", "auth": False}
+    ), patch("aioshelly.Device.create", new=AsyncMock(side_effect=exc)):
         result2 = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             {"host": "1.1.1.1"},
@@ -114,6 +144,84 @@ async def test_form_errors_test_connection(hass, error):
 
     assert result2["type"] == "form"
     assert result2["errors"] == {"base": base_error}
+
+
+async def test_form_already_configured(hass):
+    """Test we get the form."""
+    await setup.async_setup_component(hass, "persistent_notification", {})
+    entry = MockConfigEntry(
+        domain="shelly", unique_id="test-mac", data={"host": "0.0.0.0"}
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    with patch(
+        "aioshelly.get_info",
+        return_value={"mac": "test-mac", "type": "SHSW-1", "auth": False},
+    ):
+        result2 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"host": "1.1.1.1"},
+        )
+
+        assert result2["type"] == "abort"
+        assert result2["reason"] == "already_configured"
+
+    # Test config entry got updated with latest IP
+    assert entry.data["host"] == "1.1.1.1"
+
+
+async def test_form_firmware_unsupported(hass):
+    """Test we abort if device firmware is unsupported."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    with patch("aioshelly.get_info", side_effect=aioshelly.FirmwareUnsupported):
+        result2 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"host": "1.1.1.1"},
+        )
+
+        assert result2["type"] == "abort"
+        assert result2["reason"] == "unsupported_firmware"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        (aiohttp.ClientResponseError(Mock(), (), status=400), "cannot_connect"),
+        (aiohttp.ClientResponseError(Mock(), (), status=401), "invalid_auth"),
+        (asyncio.TimeoutError, "cannot_connect"),
+        (ValueError, "unknown"),
+    ],
+)
+async def test_form_auth_errors_test_connection(hass, error):
+    """Test we handle errors in authenticated devices."""
+    exc, base_error = error
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    with patch("aioshelly.get_info", return_value={"mac": "test-mac", "auth": True}):
+        result2 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"host": "1.1.1.1"},
+        )
+
+    with patch(
+        "aioshelly.Device.create",
+        new=AsyncMock(side_effect=exc),
+    ):
+        result3 = await hass.config_entries.flow.async_configure(
+            result2["flow_id"],
+            {"username": "test username", "password": "test password"},
+        )
+    assert result3["type"] == "form"
+    assert result3["errors"] == {"base": base_error}
 
 
 async def test_zeroconf(hass):
@@ -134,9 +242,11 @@ async def test_zeroconf(hass):
 
     with patch(
         "aioshelly.Device.create",
-        return_value=Mock(
-            shutdown=AsyncMock(),
-            settings={"name": "Test name", "device": {"mac": "test-mac"}},
+        new=AsyncMock(
+            return_value=Mock(
+                shutdown=AsyncMock(),
+                settings={"name": "Test name", "device": {"mac": "test-mac"}},
+            )
         ),
     ), patch(
         "homeassistant.components.shelly.async_setup", return_value=True
@@ -181,7 +291,7 @@ async def test_zeroconf_confirm_error(hass, error):
 
     with patch(
         "aioshelly.Device.create",
-        side_effect=exc,
+        new=AsyncMock(side_effect=exc),
     ):
         result2 = await hass.config_entries.flow.async_configure(
             result["flow_id"],
@@ -216,12 +326,22 @@ async def test_zeroconf_already_configured(hass):
     assert entry.data["host"] == "1.1.1.1"
 
 
+async def test_zeroconf_firmware_unsupported(hass):
+    """Test we abort if device firmware is unsupported."""
+    with patch("aioshelly.get_info", side_effect=aioshelly.FirmwareUnsupported):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            data={"host": "1.1.1.1", "name": "shelly1pm-12345"},
+            context={"source": config_entries.SOURCE_ZEROCONF},
+        )
+
+        assert result["type"] == "abort"
+        assert result["reason"] == "unsupported_firmware"
+
+
 async def test_zeroconf_cannot_connect(hass):
     """Test we get the form."""
-    with patch(
-        "aioshelly.get_info",
-        side_effect=asyncio.TimeoutError,
-    ):
+    with patch("aioshelly.get_info", side_effect=asyncio.TimeoutError):
         result = await hass.config_entries.flow.async_init(
             DOMAIN,
             data={"host": "1.1.1.1", "name": "shelly1pm-12345"},
@@ -232,7 +352,7 @@ async def test_zeroconf_cannot_connect(hass):
 
 
 async def test_zeroconf_require_auth(hass):
-    """Test we get the form."""
+    """Test zeroconf if auth is required."""
     await setup.async_setup_component(hass, "persistent_notification", {})
 
     with patch(
@@ -244,8 +364,45 @@ async def test_zeroconf_require_auth(hass):
             data={"host": "1.1.1.1", "name": "shelly1pm-12345"},
             context={"source": config_entries.SOURCE_ZEROCONF},
         )
-        assert result["type"] == "abort"
-        assert result["reason"] == "auth_not_supported"
+        assert result["type"] == "form"
+        assert result["errors"] == {}
+
+    result2 = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {},
+    )
+    assert result2["type"] == "form"
+    assert result2["errors"] == {}
+
+    with patch(
+        "aioshelly.Device.create",
+        new=AsyncMock(
+            return_value=Mock(
+                shutdown=AsyncMock(),
+                settings={"name": "Test name", "device": {"mac": "test-mac"}},
+            )
+        ),
+    ), patch(
+        "homeassistant.components.shelly.async_setup", return_value=True
+    ) as mock_setup, patch(
+        "homeassistant.components.shelly.async_setup_entry",
+        return_value=True,
+    ) as mock_setup_entry:
+        result3 = await hass.config_entries.flow.async_configure(
+            result2["flow_id"],
+            {"username": "test username", "password": "test password"},
+        )
+
+    assert result3["type"] == "create_entry"
+    assert result3["title"] == "Test name"
+    assert result3["data"] == {
+        "host": "1.1.1.1",
+        "username": "test username",
+        "password": "test password",
+    }
+    await hass.async_block_till_done()
+    assert len(mock_setup.mock_calls) == 1
+    assert len(mock_setup_entry.mock_calls) == 1
 
 
 async def test_zeroconf_not_shelly(hass):

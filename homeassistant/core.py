@@ -80,8 +80,8 @@ import homeassistant.util.uuid as uuid_util
 # Typing imports that create a circular dependency
 if TYPE_CHECKING:
     from homeassistant.auth import AuthManager
-    from homeassistant.config_entries import ConfigEntries
     from homeassistant.components.http import HomeAssistantHTTP
+    from homeassistant.config_entries import ConfigEntries
 
 
 block_async_io.enable()
@@ -158,7 +158,7 @@ class CoreState(enum.Enum):
     final_write = "FINAL_WRITE"
     stopped = "STOPPED"
 
-    def __str__(self) -> str:
+    def __str__(self) -> str:  # pylint: disable=invalid-str-returned
         """Return the event."""
         return self.value  # type: ignore
 
@@ -523,7 +523,7 @@ class EventOrigin(enum.Enum):
     local = "LOCAL"
     remote = "REMOTE"
 
-    def __str__(self) -> str:
+    def __str__(self) -> str:  # pylint: disable=invalid-str-returned
         """Return the event."""
         return self.value  # type: ignore
 
@@ -538,7 +538,7 @@ class Event:
         event_type: str,
         data: Optional[Dict[str, Any]] = None,
         origin: EventOrigin = EventOrigin.local,
-        time_fired: Optional[int] = None,
+        time_fired: Optional[datetime.datetime] = None,
         context: Optional[Context] = None,
     ) -> None:
         """Initialize a new event."""
@@ -547,6 +547,11 @@ class Event:
         self.origin = origin
         self.time_fired = time_fired or dt_util.utcnow()
         self.context: Context = context or Context()
+
+    def __hash__(self) -> int:
+        """Make hashable."""
+        # The only event type that shares context are the TIME_CHANGED
+        return hash((self.event_type, self.context.id, self.time_fired))
 
     def as_dict(self) -> Dict:
         """Create a dict representation of this Event.
@@ -754,6 +759,7 @@ class State:
     last_updated: last time this object was updated.
     context: Context in which it was created
     domain: Domain of this state.
+    object_id: Object id of this state.
     """
 
     __slots__ = [
@@ -764,6 +770,7 @@ class State:
         "last_updated",
         "context",
         "domain",
+        "object_id",
     ]
 
     def __init__(
@@ -797,12 +804,7 @@ class State:
         self.last_updated = last_updated or dt_util.utcnow()
         self.last_changed = last_changed or self.last_updated
         self.context = context or Context()
-        self.domain = split_entity_id(self.entity_id)[0]
-
-    @property
-    def object_id(self) -> str:
-        """Object id of this state."""
-        return split_entity_id(self.entity_id)[1]
+        self.domain, self.object_id = split_entity_id(self.entity_id)
 
     @property
     def name(self) -> str:
@@ -907,7 +909,7 @@ class StateMachine:
         This method must be run in the event loop.
         """
         if domain_filter is None:
-            return list(self._states.keys())
+            return list(self._states)
 
         if isinstance(domain_filter, str):
             domain_filter = (domain_filter.lower(),)
@@ -918,17 +920,47 @@ class StateMachine:
             if state.domain in domain_filter
         ]
 
-    def all(self) -> List[State]:
-        """Create a list of all states."""
-        return run_callback_threadsafe(self._loop, self.async_all).result()
-
     @callback
-    def async_all(self) -> List[State]:
-        """Create a list of all states.
+    def async_entity_ids_count(
+        self, domain_filter: Optional[Union[str, Iterable]] = None
+    ) -> int:
+        """Count the entity ids that are being tracked.
 
         This method must be run in the event loop.
         """
-        return list(self._states.values())
+        if domain_filter is None:
+            return len(self._states)
+
+        if isinstance(domain_filter, str):
+            domain_filter = (domain_filter.lower(),)
+
+        return len(
+            [None for state in self._states.values() if state.domain in domain_filter]
+        )
+
+    def all(self, domain_filter: Optional[Union[str, Iterable]] = None) -> List[State]:
+        """Create a list of all states."""
+        return run_callback_threadsafe(
+            self._loop, self.async_all, domain_filter
+        ).result()
+
+    @callback
+    def async_all(
+        self, domain_filter: Optional[Union[str, Iterable]] = None
+    ) -> List[State]:
+        """Create a list of all states matching the filter.
+
+        This method must be run in the event loop.
+        """
+        if domain_filter is None:
+            return list(self._states.values())
+
+        if isinstance(domain_filter, str):
+            domain_filter = (domain_filter.lower(),)
+
+        return [
+            state for state in self._states.values() if state.domain in domain_filter
+        ]
 
     def get(self, entity_id: str) -> Optional[State]:
         """Retrieve state of entity_id or None if not found.
@@ -1378,6 +1410,9 @@ class Config:
         # List of allowed external URLs that integrations may use
         self.allowlist_external_urls: Set[str] = set()
 
+        # Dictionary of Media folders that integrations may use
+        self.media_dirs: Dict[str, str] = {}
+
         # If Home Assistant is running in safe mode
         self.safe_mode: bool = False
 
@@ -1483,6 +1518,7 @@ class Config:
         unit_system: Optional[str] = None,
         location_name: Optional[str] = None,
         time_zone: Optional[str] = None,
+        # pylint: disable=dangerous-default-value # _UNDEFs not modified
         external_url: Optional[Union[str, dict]] = _UNDEF,
         internal_url: Optional[Union[str, dict]] = _UNDEF,
     ) -> None:
