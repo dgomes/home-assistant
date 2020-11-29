@@ -24,6 +24,7 @@ from homeassistant.const import (
     ATTR_ENTITY_ID,
     CONF_SERVICE,
     CONF_SERVICE_TEMPLATE,
+    CONF_TARGET,
     ENTITY_MATCH_ALL,
     ENTITY_MATCH_NONE,
 )
@@ -38,7 +39,13 @@ from homeassistant.helpers import template
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.template import Template
 from homeassistant.helpers.typing import ConfigType, HomeAssistantType, TemplateVarsType
-from homeassistant.loader import async_get_integration, bind_hass
+from homeassistant.loader import (
+    MAX_LOAD_CONCURRENTLY,
+    Integration,
+    async_get_integration,
+    bind_hass,
+)
+from homeassistant.util.async_ import gather_with_concurrency
 from homeassistant.util.yaml import load_yaml
 from homeassistant.util.yaml.loader import JSON_TYPE
 
@@ -130,6 +137,10 @@ def async_prepare_call_from_config(
     domain, service = domain_service.split(".", 1)
 
     service_data = {}
+
+    if CONF_TARGET in config:
+        service_data.update(config[CONF_TARGET])
+
     for conf in [CONF_SERVICE_DATA, CONF_SERVICE_DATA_TEMPLATE]:
         if conf not in config:
             continue
@@ -234,6 +245,15 @@ async def async_extract_entity_ids(
             hass.helpers.device_registry.async_get_registry(),
             hass.helpers.entity_registry.async_get_registry(),
         )
+
+        extracted.update(
+            entry.entity_id
+            for area_id in area_ids
+            for entry in hass.helpers.entity_registry.async_entries_for_area(
+                ent_reg, area_id
+            )
+        )
+
         devices = [
             device
             for area_id in area_ids
@@ -245,26 +265,35 @@ async def async_extract_entity_ids(
             entry.entity_id
             for device in devices
             for entry in hass.helpers.entity_registry.async_entries_for_device(
-                ent_reg, device.id
+                ent_reg, device.id, include_disabled_entities=True
             )
+            if not entry.area_id
         )
 
     return extracted
 
 
-async def _load_services_file(hass: HomeAssistantType, domain: str) -> JSON_TYPE:
+def _load_services_file(hass: HomeAssistantType, integration: Integration) -> JSON_TYPE:
     """Load services file for an integration."""
-    integration = await async_get_integration(hass, domain)
     try:
-        return await hass.async_add_executor_job(
-            load_yaml, str(integration.file_path / "services.yaml")
-        )
+        return load_yaml(str(integration.file_path / "services.yaml"))
     except FileNotFoundError:
-        _LOGGER.warning("Unable to find services.yaml for the %s integration", domain)
+        _LOGGER.warning(
+            "Unable to find services.yaml for the %s integration", integration.domain
+        )
         return {}
     except HomeAssistantError:
-        _LOGGER.warning("Unable to parse services.yaml for the %s integration", domain)
+        _LOGGER.warning(
+            "Unable to parse services.yaml for the %s integration", integration.domain
+        )
         return {}
+
+
+def _load_services_files(
+    hass: HomeAssistantType, integrations: Iterable[Integration]
+) -> List[JSON_TYPE]:
+    """Load service files for multiple intergrations."""
+    return [_load_services_file(hass, integration) for integration in integrations]
 
 
 @bind_hass
@@ -289,8 +318,13 @@ async def async_get_all_descriptions(
     loaded = {}
 
     if missing:
-        contents = await asyncio.gather(
-            *(_load_services_file(hass, domain) for domain in missing)
+        integrations = await gather_with_concurrency(
+            MAX_LOAD_CONCURRENTLY,
+            *(async_get_integration(hass, domain) for domain in missing),
+        )
+
+        contents = await hass.async_add_executor_job(
+            _load_services_files, hass, integrations
         )
 
         for domain, content in zip(missing, contents):
@@ -308,7 +342,7 @@ async def async_get_all_descriptions(
             # Cache missing descriptions
             if description is None:
                 domain_yaml = loaded[domain]
-                yaml_description = domain_yaml.get(service, {})
+                yaml_description = domain_yaml.get(service, {})  # type: ignore
 
                 # Don't warn for missing services, because it triggers false
                 # positives for things like scripts, that register as a service
@@ -498,11 +532,11 @@ async def _handle_entity_call(
     entity.async_set_context(context)
 
     if isinstance(func, str):
-        result = hass.async_add_job(partial(getattr(entity, func), **data))  # type: ignore
+        result = hass.async_run_job(partial(getattr(entity, func), **data))  # type: ignore
     else:
-        result = hass.async_add_job(func, entity, data)
+        result = hass.async_run_job(func, entity, data)
 
-    # Guard because callback functions do not return a task when passed to async_add_job.
+    # Guard because callback functions do not return a task when passed to async_run_job.
     if result is not None:
         await result
 
@@ -535,7 +569,7 @@ def async_register_admin_service(
             if not user.is_admin:
                 raise Unauthorized(context=call.context)
 
-        result = hass.async_add_job(service_func, call)
+        result = hass.async_run_job(service_func, call)
         if result is not None:
             await result
 

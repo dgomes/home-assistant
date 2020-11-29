@@ -217,7 +217,9 @@ class MetWeather(CoordinatorEntity, WeatherEntity):
             if not set(met_item).issuperset(required_keys):
                 continue
             ha_item = {
-                k: met_item[v] for k, v in FORECAST_MAP.items() if met_item.get(v)
+                k: met_item[v]
+                for k, v in FORECAST_MAP.items()
+                if met_item.get(v) is not None
             }
             if ha_item.get(ATTR_FORECAST_CONDITION):
                 ha_item[ATTR_FORECAST_CONDITION] = format_condition(
@@ -225,3 +227,14 @@ class MetWeather(CoordinatorEntity, WeatherEntity):
                 )
             ha_forecast.append(ha_item)
         return ha_forecast
+
+    @property
+    def device_info(self):
+        """Device info."""
+        return {
+            "identifiers": {(DOMAIN,)},
+            "manufacturer": "Met.no",
+            "model": "Forecast",
+            "default_name": "Forecast",
+            "entry_type": "service",
+        }

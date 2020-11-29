@@ -1,7 +1,6 @@
 """Support for Canary camera."""
 import asyncio
 from datetime import timedelta
-import logging
 from typing import Callable, List
 
 from haffmpeg.camera import CameraMjpeg
@@ -27,8 +26,6 @@ from .const import (
     MANUFACTURER,
 )
 from .coordinator import CanaryDataUpdateCoordinator
-
-_LOGGER = logging.getLogger(__name__)
 
 MIN_TIME_BETWEEN_SESSION_RENEW = timedelta(seconds=90)
 
@@ -81,6 +78,7 @@ class CanaryCamera(CoordinatorEntity, Camera):
     def __init__(self, hass, coordinator, location_id, device, timeout, ffmpeg_args):
         """Initialize a Canary security camera."""
         super().__init__(coordinator)
+        Camera.__init__(self)
         self._ffmpeg = hass.data[DATA_FFMPEG]
         self._ffmpeg_arguments = ffmpeg_args
         self._location_id = location_id
@@ -130,7 +128,7 @@ class CanaryCamera(CoordinatorEntity, Camera):
         """Return a still image response from the camera."""
         await self.hass.async_add_executor_job(self.renew_live_stream_session)
 
-        ffmpeg = ImageFrame(self._ffmpeg.binary, loop=self.hass.loop)
+        ffmpeg = ImageFrame(self._ffmpeg.binary)
         image = await asyncio.shield(
             ffmpeg.get_image(
                 self._live_stream_session.live_stream_url,
@@ -145,7 +143,7 @@ class CanaryCamera(CoordinatorEntity, Camera):
         if self._live_stream_session is None:
             return
 
-        stream = CameraMjpeg(self._ffmpeg.binary, loop=self.hass.loop)
+        stream = CameraMjpeg(self._ffmpeg.binary)
         await stream.open_camera(
             self._live_stream_session.live_stream_url, extra_cmd=self._ffmpeg_arguments
         )
