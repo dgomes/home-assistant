@@ -6,18 +6,20 @@ from typing import Any, Dict
 
 from rokuecp import Roku, RokuConnectionError, RokuError
 from rokuecp.models import Device
-import voluptuous as vol
 
 from homeassistant.components.media_player import DOMAIN as MEDIA_PLAYER_DOMAIN
 from homeassistant.components.remote import DOMAIN as REMOTE_DOMAIN
-from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_NAME, CONF_HOST
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.typing import HomeAssistantType
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers.update_coordinator import (
+    CoordinatorEntity,
+    DataUpdateCoordinator,
+    UpdateFailed,
+)
 from homeassistant.util.dt import utcnow
 
 from .const import (
@@ -28,14 +30,7 @@ from .const import (
     DOMAIN,
 )
 
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN: vol.All(
-            cv.ensure_list, [vol.Schema({vol.Required(CONF_HOST): cv.string})]
-        )
-    },
-    extra=vol.ALLOW_EXTRA,
-)
+CONFIG_SCHEMA = cv.deprecated(DOMAIN, invalidation_version="0.120")
 
 PLATFORMS = [MEDIA_PLAYER_DOMAIN, REMOTE_DOMAIN]
 SCAN_INTERVAL = timedelta(seconds=15)
@@ -45,17 +40,6 @@ _LOGGER = logging.getLogger(__name__)
 async def async_setup(hass: HomeAssistantType, config: Dict) -> bool:
     """Set up the Roku integration."""
     hass.data.setdefault(DOMAIN, {})
-
-    if DOMAIN in config:
-        for entry_config in config[DOMAIN]:
-            hass.async_create_task(
-                hass.config_entries.flow.async_init(
-                    DOMAIN,
-                    context={"source": SOURCE_IMPORT},
-                    data=entry_config,
-                )
-            )
-
     return True
 
 
@@ -149,41 +133,21 @@ class RokuDataUpdateCoordinator(DataUpdateCoordinator[Device]):
             raise UpdateFailed(f"Invalid response from API: {error}") from error
 
 
-class RokuEntity(Entity):
+class RokuEntity(CoordinatorEntity):
     """Defines a base Roku entity."""
 
     def __init__(
         self, *, device_id: str, name: str, coordinator: RokuDataUpdateCoordinator
     ) -> None:
         """Initialize the Roku entity."""
+        super().__init__(coordinator)
         self._device_id = device_id
         self._name = name
-        self.coordinator = coordinator
-
-    @property
-    def available(self) -> bool:
-        """Return True if entity is available."""
-        return self.coordinator.last_update_success
 
     @property
     def name(self) -> str:
         """Return the name of the entity."""
         return self._name
-
-    @property
-    def should_poll(self) -> bool:
-        """Return the polling requirement of the entity."""
-        return False
-
-    async def async_added_to_hass(self) -> None:
-        """Connect to dispatcher listening for entity data notifications."""
-        self.async_on_remove(
-            self.coordinator.async_add_listener(self.async_write_ha_state)
-        )
-
-    async def async_update(self) -> None:
-        """Update an Roku entity."""
-        await self.coordinator.async_request_refresh()
 
     @property
     def device_info(self) -> Dict[str, Any]:

@@ -2,20 +2,21 @@
 from datetime import datetime, timedelta
 import json
 
-from homeassistant.components.brother.const import UNIT_PAGES
+from homeassistant.components.brother.const import DOMAIN, UNIT_PAGES
+from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
 from homeassistant.const import (
     ATTR_DEVICE_CLASS,
     ATTR_ENTITY_ID,
     ATTR_ICON,
     ATTR_UNIT_OF_MEASUREMENT,
     DEVICE_CLASS_TIMESTAMP,
+    PERCENTAGE,
     STATE_UNAVAILABLE,
-    UNIT_PERCENTAGE,
 )
 from homeassistant.setup import async_setup_component
 from homeassistant.util.dt import UTC, utcnow
 
-from tests.async_mock import patch
+from tests.async_mock import Mock, patch
 from tests.common import async_fire_time_changed, load_fixture
 from tests.components.brother import init_integration
 
@@ -25,13 +26,25 @@ ATTR_COUNTER = "counter"
 
 async def test_sensors(hass):
     """Test states of the sensors."""
-    test_time = datetime(2019, 11, 11, 9, 10, 32, tzinfo=UTC)
-    with patch(
-        "homeassistant.components.brother.sensor.utcnow", return_value=test_time
-    ):
-        await init_integration(hass)
+    entry = await init_integration(hass, skip_setup=True)
 
     registry = await hass.helpers.entity_registry.async_get_registry()
+
+    # Pre-create registry entries for disabled by default sensors
+    registry.async_get_or_create(
+        SENSOR_DOMAIN,
+        DOMAIN,
+        "0123456789_uptime",
+        suggested_object_id="hl_l2340dw_uptime",
+        disabled_by=None,
+    )
+    test_time = datetime(2019, 11, 11, 9, 10, 32, tzinfo=UTC)
+    with patch("brother.datetime", utcnow=Mock(return_value=test_time)), patch(
+        "brother.Brother._get_data",
+        return_value=json.loads(load_fixture("brother_printer_data.json")),
+    ):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
 
     state = hass.states.get("sensor.hl_l2340dw_status")
     assert state
@@ -45,7 +58,7 @@ async def test_sensors(hass):
     state = hass.states.get("sensor.hl_l2340dw_black_toner_remaining")
     assert state
     assert state.attributes.get(ATTR_ICON) == "mdi:printer-3d-nozzle"
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UNIT_PERCENTAGE
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == PERCENTAGE
     assert state.state == "75"
 
     entry = registry.async_get("sensor.hl_l2340dw_black_toner_remaining")
@@ -55,7 +68,7 @@ async def test_sensors(hass):
     state = hass.states.get("sensor.hl_l2340dw_cyan_toner_remaining")
     assert state
     assert state.attributes.get(ATTR_ICON) == "mdi:printer-3d-nozzle"
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UNIT_PERCENTAGE
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == PERCENTAGE
     assert state.state == "10"
 
     entry = registry.async_get("sensor.hl_l2340dw_cyan_toner_remaining")
@@ -65,7 +78,7 @@ async def test_sensors(hass):
     state = hass.states.get("sensor.hl_l2340dw_magenta_toner_remaining")
     assert state
     assert state.attributes.get(ATTR_ICON) == "mdi:printer-3d-nozzle"
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UNIT_PERCENTAGE
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == PERCENTAGE
     assert state.state == "8"
 
     entry = registry.async_get("sensor.hl_l2340dw_magenta_toner_remaining")
@@ -75,7 +88,7 @@ async def test_sensors(hass):
     state = hass.states.get("sensor.hl_l2340dw_yellow_toner_remaining")
     assert state
     assert state.attributes.get(ATTR_ICON) == "mdi:printer-3d-nozzle"
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UNIT_PERCENTAGE
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == PERCENTAGE
     assert state.state == "2"
 
     entry = registry.async_get("sensor.hl_l2340dw_yellow_toner_remaining")
@@ -87,7 +100,7 @@ async def test_sensors(hass):
     assert state.attributes.get(ATTR_ICON) == "mdi:chart-donut"
     assert state.attributes.get(ATTR_REMAINING_PAGES) == 11014
     assert state.attributes.get(ATTR_COUNTER) == 986
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UNIT_PERCENTAGE
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == PERCENTAGE
     assert state.state == "92"
 
     entry = registry.async_get("sensor.hl_l2340dw_drum_remaining_life")
@@ -99,7 +112,7 @@ async def test_sensors(hass):
     assert state.attributes.get(ATTR_ICON) == "mdi:chart-donut"
     assert state.attributes.get(ATTR_REMAINING_PAGES) == 16389
     assert state.attributes.get(ATTR_COUNTER) == 1611
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UNIT_PERCENTAGE
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == PERCENTAGE
     assert state.state == "92"
 
     entry = registry.async_get("sensor.hl_l2340dw_black_drum_remaining_life")
@@ -111,7 +124,7 @@ async def test_sensors(hass):
     assert state.attributes.get(ATTR_ICON) == "mdi:chart-donut"
     assert state.attributes.get(ATTR_REMAINING_PAGES) == 16389
     assert state.attributes.get(ATTR_COUNTER) == 1611
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UNIT_PERCENTAGE
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == PERCENTAGE
     assert state.state == "92"
 
     entry = registry.async_get("sensor.hl_l2340dw_cyan_drum_remaining_life")
@@ -123,7 +136,7 @@ async def test_sensors(hass):
     assert state.attributes.get(ATTR_ICON) == "mdi:chart-donut"
     assert state.attributes.get(ATTR_REMAINING_PAGES) == 16389
     assert state.attributes.get(ATTR_COUNTER) == 1611
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UNIT_PERCENTAGE
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == PERCENTAGE
     assert state.state == "92"
 
     entry = registry.async_get("sensor.hl_l2340dw_magenta_drum_remaining_life")
@@ -135,7 +148,7 @@ async def test_sensors(hass):
     assert state.attributes.get(ATTR_ICON) == "mdi:chart-donut"
     assert state.attributes.get(ATTR_REMAINING_PAGES) == 16389
     assert state.attributes.get(ATTR_COUNTER) == 1611
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UNIT_PERCENTAGE
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == PERCENTAGE
     assert state.state == "92"
 
     entry = registry.async_get("sensor.hl_l2340dw_yellow_drum_remaining_life")
@@ -145,7 +158,7 @@ async def test_sensors(hass):
     state = hass.states.get("sensor.hl_l2340dw_fuser_remaining_life")
     assert state
     assert state.attributes.get(ATTR_ICON) == "mdi:water-outline"
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UNIT_PERCENTAGE
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == PERCENTAGE
     assert state.state == "97"
 
     entry = registry.async_get("sensor.hl_l2340dw_fuser_remaining_life")
@@ -155,7 +168,7 @@ async def test_sensors(hass):
     state = hass.states.get("sensor.hl_l2340dw_belt_unit_remaining_life")
     assert state
     assert state.attributes.get(ATTR_ICON) == "mdi:current-ac"
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UNIT_PERCENTAGE
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == PERCENTAGE
     assert state.state == "97"
 
     entry = registry.async_get("sensor.hl_l2340dw_belt_unit_remaining_life")
@@ -165,7 +178,7 @@ async def test_sensors(hass):
     state = hass.states.get("sensor.hl_l2340dw_pf_kit_1_remaining_life")
     assert state
     assert state.attributes.get(ATTR_ICON) == "mdi:printer-3d"
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UNIT_PERCENTAGE
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == PERCENTAGE
     assert state.state == "98"
 
     entry = registry.async_get("sensor.hl_l2340dw_pf_kit_1_remaining_life")
@@ -222,6 +235,21 @@ async def test_sensors(hass):
     entry = registry.async_get("sensor.hl_l2340dw_uptime")
     assert entry
     assert entry.unique_id == "0123456789_uptime"
+
+
+async def test_disabled_by_default_sensors(hass):
+    """Test the disabled by default Brother sensors."""
+    await init_integration(hass)
+
+    registry = await hass.helpers.entity_registry.async_get_registry()
+    state = hass.states.get("sensor.hl_l2340dw_uptime")
+    assert state is None
+
+    entry = registry.async_get("sensor.hl_l2340dw_uptime")
+    assert entry
+    assert entry.unique_id == "0123456789_uptime"
+    assert entry.disabled
+    assert entry.disabled_by == "integration"
 
 
 async def test_availability(hass):

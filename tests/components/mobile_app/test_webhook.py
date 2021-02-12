@@ -1,6 +1,4 @@
 """Webhook tests for mobile_app."""
-import logging
-
 import pytest
 
 from homeassistant.components.camera import SUPPORT_STREAM as CAMERA_SUPPORT_STREAM
@@ -16,14 +14,12 @@ from .const import CALL_SERVICE, FIRE_EVENT, REGISTER_CLEARTEXT, RENDER_TEMPLATE
 from tests.async_mock import patch
 from tests.common import async_mock_service
 
-_LOGGER = logging.getLogger(__name__)
-
 
 def encrypt_payload(secret_key, payload):
     """Return a encrypted payload given a key and dictionary of data."""
     try:
-        from nacl.secret import SecretBox
         from nacl.encoding import Base64Encoder
+        from nacl.secret import SecretBox
     except (ImportError, OSError):
         pytest.skip("libnacl/libsodium is not installed")
         return
@@ -45,8 +41,8 @@ def encrypt_payload(secret_key, payload):
 def decrypt_payload(secret_key, encrypted_data):
     """Return a decrypted payload given a key and a string of encrypted data."""
     try:
-        from nacl.secret import SecretBox
         from nacl.encoding import Base64Encoder
+        from nacl.secret import SecretBox
     except (ImportError, OSError):
         pytest.skip("libnacl/libsodium is not installed")
         return
@@ -70,13 +66,26 @@ async def test_webhook_handle_render_template(create_registrations, webhook_clie
     """Test that we render templates properly."""
     resp = await webhook_client.post(
         "/api/webhook/{}".format(create_registrations[1]["webhook_id"]),
-        json=RENDER_TEMPLATE,
+        json={
+            "type": "render_template",
+            "data": {
+                "one": {"template": "Hello world"},
+                "two": {"template": "{{ now() | random }}"},
+                "three": {"template": "{{ now() 3 }}"},
+            },
+        },
     )
 
     assert resp.status == 200
 
     json = await resp.json()
-    assert json == {"one": "Hello world"}
+    assert json == {
+        "one": "Hello world",
+        "two": {"error": "TypeError: object of type 'datetime.datetime' has no len()"},
+        "three": {
+            "error": "TemplateSyntaxError: expected token 'end of print statement', got 'integer'"
+        },
+    }
 
 
 async def test_webhook_handle_call_services(hass, create_registrations, webhook_client):
