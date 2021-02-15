@@ -1,8 +1,5 @@
 {
   "domain": "rrd",
-  "name": "RRD Recorder",
-  "documentation": "https://github.com/dgomes/rrd_recorder",
   "requirements": ["rrdtool==0.1.15"],
   "codeowners": ["@dgomes", "@ma-zal"],
-  "issue_tracker": "https://github.com/dgomes/rrd_recorder/issues"
 }
