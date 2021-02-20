@@ -306,13 +306,14 @@ async def _test_self_reset(hass, config, start_time, expect_reset=True):
     """Test energy sensor self reset."""
     assert await async_setup_component(hass, DOMAIN, config)
     assert await async_setup_component(hass, SENSOR_DOMAIN, config)
-    await hass.async_block_till_done()
-
-    hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
-    entity_id = config[DOMAIN]["energy_bill"]["source"]
 
     now = dt_util.parse_datetime(start_time)
     with alter_time(now):
+        await hass.async_block_till_done()
+
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
+        entity_id = config[DOMAIN]["energy_bill"]["source"]
+
         async_fire_time_changed(hass, now)
         hass.states.async_set(
             entity_id, 1, {ATTR_UNIT_OF_MEASUREMENT: ENERGY_KILO_WATT_HOUR}
@@ -349,6 +350,22 @@ async def _test_self_reset(hass, config, start_time, expect_reset=True):
     else:
         assert state.attributes.get("last_period") == 0
         assert state.state == "5"
+
+
+async def test_self_reset_cron_pattern(hass, legacy_patchable_time):
+    """Test cron pattern reset of meter."""
+    config = gen_config("yearly")  # ignored because cron is defined
+    config["utility_meter"]["energy_bill"]["cron"] = "0 0 1 * *"
+
+    await _test_self_reset(hass, config, "2017-01-31T23:59:00.000000+00:00")
+
+
+async def test_bad_cron_pattern(hass, legacy_patchable_time):
+    """Test cron pattern reset of meter."""
+    config = gen_config("hourly")
+    config["utility_meter"]["energy_bill"]["cron"] = "trash"
+
+    assert not await async_setup_component(hass, DOMAIN, config)
 
 
 async def test_self_reset_quarter_hourly(hass, legacy_patchable_time):

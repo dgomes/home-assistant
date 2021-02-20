@@ -3,5 +3,6 @@
   "name": "Utility Meter",
   "documentation": "https://www.home-assistant.io/integrations/utility_meter",
   "codeowners": ["@dgomes"],
+  "requirements": ["croniter==1.0.6"],
   "quality_scale": "internal"
 }
