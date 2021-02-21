@@ -25,6 +25,7 @@ from homeassistant.helpers.restore_state import RestoreEntity
 import homeassistant.util.dt as dt_util
 
 from .const import (
+    ATTR_CRON_PATTERN,
     ATTR_VALUE,
     BIMONTHLY,
     CONF_CRON_PATTERN,
@@ -351,6 +352,8 @@ class UtilityMeterSensor(RestoreEntity):
         }
         if self._period is not None:
             state_attr[ATTR_PERIOD] = self._period
+        if self._cron_pattern is not None:
+            state_attr[ATTR_CRON_PATTERN] = self._cron_pattern
         if self._tariff is not None:
             state_attr[ATTR_TARIFF] = self._tariff
         return state_attr
