@@ -77,6 +77,7 @@ _NOT_SPEED_INTERVAL = "interval"
 _NOT_SPEED_IDLE = "idle"
 _NOT_SPEED_FAVORITE = "favorite"
 _NOT_SPEED_SLEEP = "sleep"
+_NOT_SPEED_SILENT = "silent"
 
 _NOT_SPEEDS_FILTER = {
     _NOT_SPEED_OFF,
@@ -85,6 +86,7 @@ _NOT_SPEEDS_FILTER = {
     _NOT_SPEED_SMART,
     _NOT_SPEED_INTERVAL,
     _NOT_SPEED_IDLE,
+    _NOT_SPEED_SILENT,
     _NOT_SPEED_SLEEP,
     _NOT_SPEED_FAVORITE,
 }
@@ -272,15 +274,17 @@ class FanEntity(ToggleEntity):
         else:
             await self.async_set_speed(self.percentage_to_speed(percentage))
 
-    async def async_increase_speed(self, percentage_step=None) -> None:
+    async def async_increase_speed(self, percentage_step: Optional[int] = None) -> None:
         """Increase the speed of the fan."""
         await self._async_adjust_speed(1, percentage_step)
 
-    async def async_decrease_speed(self, percentage_step=None) -> None:
+    async def async_decrease_speed(self, percentage_step: Optional[int] = None) -> None:
         """Decrease the speed of the fan."""
         await self._async_adjust_speed(-1, percentage_step)
 
-    async def _async_adjust_speed(self, modifier, percentage_step) -> None:
+    async def _async_adjust_speed(
+        self, modifier: int, percentage_step: Optional[int]
+    ) -> None:
         """Increase or decrease the speed of the fan."""
         current_percentage = self.percentage or 0
 
@@ -342,7 +346,6 @@ class FanEntity(ToggleEntity):
         """Turn on the fan."""
         raise NotImplementedError()
 
-    # pylint: disable=arguments-differ
     async def async_turn_on_compat(
         self,
         speed: Optional[str] = None,
@@ -462,7 +465,7 @@ class FanEntity(ToggleEntity):
         return 0
 
     @property
-    def speed_count(self) -> Optional[int]:
+    def speed_count(self) -> int:
         """Return the number of speeds the fan supports."""
         speed_list = speed_list_without_preset_modes(self.speed_list)
         if speed_list:
@@ -470,7 +473,7 @@ class FanEntity(ToggleEntity):
         return 100
 
     @property
-    def percentage_step(self) -> Optional[float]:
+    def percentage_step(self) -> float:
         """Return the step size for percentage."""
         return 100 / self.speed_count
 
@@ -650,7 +653,7 @@ def speed_list_without_preset_modes(speed_list: List):
       output: ["1", "2", "3", "4", "5", "6", "7"]
 
       input: ["Auto", "Silent", "Favorite", "Idle", "Medium", "High", "Strong"]
-      output: ["Silent", "Medium", "High", "Strong"]
+      output: ["Medium", "High", "Strong"]
     """
 
     return [speed for speed in speed_list if speed.lower() not in _NOT_SPEEDS_FILTER]
@@ -672,7 +675,7 @@ def preset_modes_from_speed_list(speed_list: List):
       output: ["smart"]
 
       input: ["Auto", "Silent", "Favorite", "Idle", "Medium", "High", "Strong"]
-      output: ["Auto", "Favorite", "Idle"]
+      output: ["Auto", "Silent", "Favorite", "Idle"]
     """
 
     return [

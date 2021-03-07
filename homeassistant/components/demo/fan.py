@@ -211,12 +211,12 @@ class DemoPercentageFan(BaseDemoFan, FanEntity):
     """A demonstration fan component that uses percentages."""
 
     @property
-    def percentage(self) -> str:
+    def percentage(self) -> Optional[int]:
         """Return the current speed."""
         return self._percentage
 
     @property
-    def speed_count(self) -> Optional[float]:
+    def speed_count(self) -> int:
         """Return the number of speeds the fan supports."""
         return 3
 
@@ -271,12 +271,12 @@ class AsyncDemoPercentageFan(BaseDemoFan, FanEntity):
     """An async demonstration fan component that uses percentages."""
 
     @property
-    def percentage(self) -> str:
+    def percentage(self) -> Optional[int]:
         """Return the current speed."""
         return self._percentage
 
     @property
-    def speed_count(self) -> Optional[float]:
+    def speed_count(self) -> int:
         """Return the number of speeds the fan supports."""
         return 3
 
