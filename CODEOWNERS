@@ -1038,6 +1038,8 @@ build.json @home-assistant/supervisor
 /homeassistant/components/safe_mode/ @home-assistant/core
 /tests/components/safe_mode/ @home-assistant/core
 /homeassistant/components/saj/ @fredericvl
+/homeassistant/components/sampler/ @dgomes
+/tests/components/sampler/ @dgomes
 /homeassistant/components/samsungtv/ @chemelli74 @epenet
 /tests/components/samsungtv/ @chemelli74 @epenet
 /homeassistant/components/scene/ @home-assistant/core

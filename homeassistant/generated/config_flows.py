@@ -9,6 +9,7 @@ FLOWS = {
         "group",
         "integration",
         "min_max",
+        "sampler",
         "switch_as_x",
         "threshold",
         "tod",

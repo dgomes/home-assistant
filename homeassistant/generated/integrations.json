@@ -6583,6 +6583,12 @@
       "config_flow": true,
       "iot_class": "calculated"
     },
+    "sampler": {
+      "name": "Sampler",
+      "integration_type": "helper",
+      "config_flow": true,
+      "iot_class": "local_polling"
+    },
     "schedule": {
       "integration_type": "helper",
       "config_flow": false
