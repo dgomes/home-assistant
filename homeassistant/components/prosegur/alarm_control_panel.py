@@ -77,6 +77,7 @@ class ProsegurAlarm(AlarmControlPanelEntity):
 
         try:
             self._installation = await Installation.retrieve(self._auth, self.contract)
+            await self._installation.panel_status(self._auth)
         except ConnectionError as err:
             _LOGGER.error(err)
             self._attr_available = False
