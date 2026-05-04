@@ -1,0 +1,151 @@
+"""Python Control of Nobø Hub - Nobø Energy Control."""
+
+from pynobo import nobo
+
+from homeassistant.components.select import SelectEntity
+from homeassistant.const import ATTR_NAME
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+
+from . import NoboHubConfigEntry
+from .const import (
+    ATTR_HARDWARE_VERSION,
+    ATTR_SERIAL,
+    ATTR_SOFTWARE_VERSION,
+    CONF_OVERRIDE_TYPE,
+    DOMAIN,
+    NOBO_MANUFACTURER,
+    OVERRIDE_TYPE_NOW,
+)
+from .entity import NoboBaseEntity
+
+PARALLEL_UPDATES = 0
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: NoboHubConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up any temperature sensors connected to the Nobø Ecohub."""
+
+    # Setup connection with hub
+    hub = config_entry.runtime_data
+
+    override_type = (
+        nobo.API.OVERRIDE_TYPE_NOW
+        if config_entry.options.get(CONF_OVERRIDE_TYPE) == OVERRIDE_TYPE_NOW
+        else nobo.API.OVERRIDE_TYPE_CONSTANT
+    )
+
+    entities: list[SelectEntity] = [
+        NoboProfileSelector(zone_id, hub) for zone_id in hub.zones
+    ]
+    entities.append(NoboGlobalSelector(hub, override_type))
+    async_add_entities(entities, True)
+
+
+class NoboGlobalSelector(NoboBaseEntity, SelectEntity):
+    """Global override selector for Nobø Ecohub."""
+
+    _attr_translation_key = "global_override"
+    _attr_device_class = "nobo_hub__override"
+    _modes = {
+        nobo.API.OVERRIDE_MODE_NORMAL: "none",
+        nobo.API.OVERRIDE_MODE_AWAY: "away",
+        nobo.API.OVERRIDE_MODE_COMFORT: "comfort",
+        nobo.API.OVERRIDE_MODE_ECO: "eco",
+    }
+    _attr_options = list(_modes.values())
+    _attr_current_option: str | None = None
+
+    def __init__(self, hub: nobo, override_type) -> None:
+        """Initialize the global override selector."""
+        super().__init__(hub)
+        self._attr_unique_id = hub.hub_serial
+        self._override_type = override_type
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, hub.hub_serial)},
+            serial_number=hub.hub_serial,
+            name=hub.hub_info[ATTR_NAME],
+            manufacturer=NOBO_MANUFACTURER,
+            model="Nobø Ecohub",
+            sw_version=hub.hub_info[ATTR_SOFTWARE_VERSION],
+            hw_version=hub.hub_info[ATTR_HARDWARE_VERSION],
+        )
+
+    async def async_select_option(self, option: str) -> None:
+        """Set override."""
+        mode = [k for k, v in self._modes.items() if v == option][0]
+        try:
+            await self._nobo.async_create_override(
+                mode, self._override_type, nobo.API.OVERRIDE_TARGET_GLOBAL
+            )
+        except Exception as exp:
+            raise HomeAssistantError from exp
+
+    async def async_update(self) -> None:
+        """Fetch new state data for this zone."""
+        self._read_state()
+
+    @callback
+    def _read_state(self) -> None:
+        """Read the current state from the hub. These are only local calls."""
+        for override in self._nobo.overrides.values():
+            if override["target_type"] == nobo.API.OVERRIDE_TARGET_GLOBAL:
+                self._attr_current_option = self._modes[override["mode"]]
+                break
+
+
+class NoboProfileSelector(NoboBaseEntity, SelectEntity):
+    """Week profile selector for Nobø zones."""
+
+    _attr_translation_key = "week_profile"
+    _profiles: dict[int, str] = {}
+    _attr_options: list[str] = []
+    _attr_current_option: str | None = None
+
+    def __init__(self, zone_id: str, hub: nobo) -> None:
+        """Initialize the week profile selector."""
+        super().__init__(hub)
+        self._id = zone_id
+        self._attr_unique_id = f"{hub.hub_serial}:{zone_id}:profile"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, f"{hub.hub_serial}:{zone_id}")},
+            name=hub.zones[zone_id][ATTR_NAME],
+            via_device=(DOMAIN, hub.hub_info[ATTR_SERIAL]),
+            suggested_area=hub.zones[zone_id][ATTR_NAME],
+        )
+
+    async def async_select_option(self, option: str) -> None:
+        """Set week profile."""
+        week_profile_id = [k for k, v in self._profiles.items() if v == option][0]
+        try:
+            await self._nobo.async_update_zone(
+                self._id, week_profile_id=week_profile_id
+            )
+        except Exception as exp:
+            raise HomeAssistantError from exp
+
+    async def async_update(self) -> None:
+        """Fetch new state data for this zone."""
+        self._read_state()
+
+    @callback
+    def _read_state(self) -> None:
+        """Read the current state from the hub. These are only local calls."""
+        if self._id not in self._nobo.zones:
+            # Zone removed via the Nobø app; mark unavailable.
+            self._attr_available = False
+            return
+        self._attr_available = True
+        self._profiles = {
+            profile["week_profile_id"]: profile["name"].replace("\xa0", " ")
+            for profile in self._nobo.week_profiles.values()
+        }
+        self._attr_options = sorted(self._profiles.values())
+        self._attr_current_option = self._profiles[
+            self._nobo.zones[self._id]["week_profile_id"]
+        ]

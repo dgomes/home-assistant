@@ -1,0 +1,21 @@
+{
+  "entity": {
+    "sensor": {
+      "hydrological_alert": {
+        "default": "mdi:alert-octagon-outline"
+      },
+      "ice_phenomena": {
+        "default": "mdi:snowflake"
+      },
+      "water_flow": {
+        "default": "mdi:waves-arrow-right"
+      },
+      "water_level": {
+        "default": "mdi:waves"
+      },
+      "water_temperature": {
+        "default": "mdi:thermometer-water"
+      }
+    }
+  }
+}

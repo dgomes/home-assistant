@@ -1,169 +1,137 @@
-"""Asyncio backports for Python 3.4.3 compatibility."""
+"""Asyncio utilities."""
+
+from asyncio import (
+    AbstractEventLoop,
+    Future,
+    Semaphore,
+    Task,
+    TimerHandle,
+    gather,
+    get_running_loop,
+)
+from collections.abc import Awaitable, Callable, Coroutine
 import concurrent.futures
-import threading
 import logging
-from asyncio import coroutines
-from asyncio.futures import Future
-
-from asyncio import ensure_future
-
+import threading
+from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
-
-def _set_result_unless_cancelled(fut, result):
-    """Set the result only if the Future was not cancelled."""
-    if fut.cancelled():
-        return
-    fut.set_result(result)
+_SHUTDOWN_RUN_CALLBACK_THREADSAFE = "_shutdown_run_callback_threadsafe"
 
 
-def _set_concurrent_future_state(concurr, source):
-    """Copy state from a future to a concurrent.futures.Future."""
-    assert source.done()
-    if source.cancelled():
-        concurr.cancel()
-    if not concurr.set_running_or_notify_cancel():
-        return
-    exception = source.exception()
-    if exception is not None:
-        concurr.set_exception(exception)
-    else:
-        result = source.result()
-        concurr.set_result(result)
-
-
-def _copy_future_state(source, dest):
-    """Copy state from another Future.
-
-    The other Future may be a concurrent.futures.Future.
-    """
-    assert source.done()
-    if dest.cancelled():
-        return
-    assert not dest.done()
-    if source.cancelled():
-        dest.cancel()
-    else:
-        exception = source.exception()
-        if exception is not None:
-            dest.set_exception(exception)
-        else:
-            result = source.result()
-            dest.set_result(result)
-
-
-def _chain_future(source, destination):
-    """Chain two futures so that when one completes, so does the other.
-
-    The result (or exception) of source will be copied to destination.
-    If destination is cancelled, source gets cancelled too.
-    Compatible with both asyncio.Future and concurrent.futures.Future.
-    """
-    if not isinstance(source, (Future, concurrent.futures.Future)):
-        raise TypeError('A future is required for source argument')
-    if not isinstance(destination, (Future, concurrent.futures.Future)):
-        raise TypeError('A future is required for destination argument')
-    # pylint: disable=protected-access
-    source_loop = source._loop if isinstance(source, Future) else None
-    dest_loop = destination._loop if isinstance(destination, Future) else None
-
-    def _set_state(future, other):
-        if isinstance(future, Future):
-            _copy_future_state(other, future)
-        else:
-            _set_concurrent_future_state(future, other)
-
-    def _call_check_cancel(destination):
-        if destination.cancelled():
-            if source_loop is None or source_loop is dest_loop:
-                source.cancel()
-            else:
-                source_loop.call_soon_threadsafe(source.cancel)
-
-    def _call_set_state(source):
-        if dest_loop is None or dest_loop is source_loop:
-            _set_state(destination, source)
-        else:
-            dest_loop.call_soon_threadsafe(_set_state, destination, source)
-
-    destination.add_done_callback(_call_check_cancel)
-    source.add_done_callback(_call_set_state)
-
-
-def run_coroutine_threadsafe(coro, loop):
-    """Submit a coroutine object to a given event loop.
-
-    Return a concurrent.futures.Future to access the result.
-    """
-    ident = loop.__dict__.get("_thread_ident")
-    if ident is not None and ident == threading.get_ident():
-        raise RuntimeError('Cannot be called from within the event loop')
-
-    if not coroutines.iscoroutine(coro):
-        raise TypeError('A coroutine object is required')
-    future = concurrent.futures.Future()
-
-    def callback():
-        """Handle the call to the coroutine."""
+def create_eager_task[_T](
+    coro: Coroutine[Any, Any, _T],
+    *,
+    name: str | None = None,
+    loop: AbstractEventLoop | None = None,
+) -> Task[_T]:
+    """Create a task from a coroutine and schedule it to run immediately."""
+    if not loop:
         try:
-            # pylint: disable=deprecated-method
-            _chain_future(ensure_future(coro, loop=loop), future)
-        # pylint: disable=broad-except
-        except Exception as exc:
-            if future.set_running_or_notify_cancel():
-                future.set_exception(exc)
-            else:
-                _LOGGER.warning("Exception on lost future: ", exc_info=True)
+            loop = get_running_loop()
+        except RuntimeError:
+            # If there is no running loop, create_eager_task is being called from
+            # the wrong thread.
+            # Late import to avoid circular dependencies
+            from homeassistant.helpers import frame  # noqa: PLC0415
 
-    loop.call_soon_threadsafe(callback)
-    return future
+            frame.report_usage("attempted to create an asyncio task from a thread")
+            raise
 
-
-def fire_coroutine_threadsafe(coro, loop):
-    """Submit a coroutine object to a given event loop.
-
-    This method does not provide a way to retrieve the result and
-    is intended for fire-and-forget use. This reduces the
-    work involved to fire the function on the loop.
-    """
-    ident = loop.__dict__.get("_thread_ident")
-    if ident is not None and ident == threading.get_ident():
-        raise RuntimeError('Cannot be called from within the event loop')
-
-    if not coroutines.iscoroutine(coro):
-        raise TypeError('A coroutine object is required: %s' % coro)
-
-    def callback():
-        """Handle the firing of a coroutine."""
-        # pylint: disable=deprecated-method
-        ensure_future(coro, loop=loop)
-
-    loop.call_soon_threadsafe(callback)
-    return
+    return Task(coro, loop=loop, name=name, eager_start=True)
 
 
-def run_callback_threadsafe(loop, callback, *args):
+def cancelling(task: Future[Any]) -> bool:
+    """Return True if task is cancelling."""
+    return bool((cancelling_ := getattr(task, "cancelling", None)) and cancelling_())
+
+
+def run_callback_threadsafe[_T, *_Ts](
+    loop: AbstractEventLoop, callback: Callable[[*_Ts], _T], *args: *_Ts
+) -> concurrent.futures.Future[_T]:
     """Submit a callback object to a given event loop.
 
     Return a concurrent.futures.Future to access the result.
     """
-    ident = loop.__dict__.get("_thread_ident")
-    if ident is not None and ident == threading.get_ident():
-        raise RuntimeError('Cannot be called from within the event loop')
+    if (ident := loop.__dict__.get("_thread_id")) and ident == threading.get_ident():
+        raise RuntimeError("Cannot be called from within the event loop")
 
-    future = concurrent.futures.Future()
+    future: concurrent.futures.Future[_T] = concurrent.futures.Future()
 
-    def run_callback():
+    def run_callback() -> None:
         """Run callback and store result."""
         try:
             future.set_result(callback(*args))
-        # pylint: disable=broad-except
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             if future.set_running_or_notify_cancel():
                 future.set_exception(exc)
             else:
                 _LOGGER.warning("Exception on lost future: ", exc_info=True)
 
     loop.call_soon_threadsafe(run_callback)
+
+    if hasattr(loop, _SHUTDOWN_RUN_CALLBACK_THREADSAFE):
+        #
+        # If the final `HomeAssistant.async_block_till_done` in
+        # `HomeAssistant.async_stop` has already been called, the callback
+        # will never run and, `future.result()` will block forever which
+        # will prevent the thread running this code from shutting down which
+        # will result in a deadlock when the main thread attempts to shutdown
+        # the executor and `.join()` the thread running this code.
+        #
+        # To prevent this deadlock we do the following on shutdown:
+        #
+        # 1. Set the _SHUTDOWN_RUN_CALLBACK_THREADSAFE attr on this function
+        #    by calling `shutdown_run_callback_threadsafe`
+        # 2. Call `hass.async_block_till_done` at least once after shutdown
+        #    to ensure all callbacks have run
+        # 3. Raise an exception here to ensure `future.result()` can never be
+        #    called and hit the deadlock since once `shutdown_run_callback_threadsafe`
+        #    we cannot promise the callback will be executed.
+        #
+        raise RuntimeError("The event loop is in the process of shutting down.")
+
     return future
+
+
+async def gather_with_limited_concurrency(
+    limit: int, *tasks: Any, return_exceptions: bool = False
+) -> Any:
+    """Wrap asyncio.gather to limit the number of concurrent tasks.
+
+    From: https://stackoverflow.com/a/61478547/9127614
+    """
+    semaphore = Semaphore(limit)
+
+    async def sem_task(task: Awaitable[Any]) -> Any:
+        async with semaphore:
+            return await task
+
+    return await gather(
+        *(create_eager_task(sem_task(task)) for task in tasks),
+        return_exceptions=return_exceptions,
+    )
+
+
+def shutdown_run_callback_threadsafe(loop: AbstractEventLoop) -> None:
+    """Call when run_callback_threadsafe should prevent creating new futures.
+
+    We must finish all callbacks before the executor is shutdown
+    or we can end up in a deadlock state where:
+
+    `executor.result()` is waiting for its `._condition`
+    and the executor shutdown is trying to `.join()` the
+    executor thread.
+
+    This function is considered irreversible and should only ever
+    be called when Home Assistant is going to shutdown and
+    python is going to exit.
+    """
+    setattr(loop, _SHUTDOWN_RUN_CALLBACK_THREADSAFE, True)
+
+
+def get_scheduled_timer_handles(loop: AbstractEventLoop) -> list[TimerHandle]:
+    """Return a list of scheduled TimerHandles."""
+    handles: list[TimerHandle] = loop._scheduled  # type: ignore[attr-defined] # noqa: SLF001
+    return handles

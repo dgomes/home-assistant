@@ -1,12 +1,16 @@
 """Decorator utility functions."""
 
+from collections.abc import Callable, Hashable
+from typing import Any
 
-class Registry(dict):
+
+class Registry[_KT: Hashable, _VT: Callable[..., Any]](dict[_KT, _VT]):
     """Registry of items."""
 
-    def register(self, name):
+    def register(self, name: _KT) -> Callable[[_VT], _VT]:
         """Return decorator to register item with a specific name."""
-        def decorator(func):
+
+        def decorator(func: _VT) -> _VT:
             """Register decorated function."""
             self[name] = func
             return func

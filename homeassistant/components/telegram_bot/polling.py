@@ -1,128 +1,99 @@
-"""
-Telegram bot polling implementation.
+"""Support for Telegram bot using polling."""
 
-For more details about this platform, please refer to the documentation at
-https://home-assistant.io/components/telegram_bot.polling/
-"""
-import asyncio
-from asyncio.futures import CancelledError
 import logging
 
-import async_timeout
-from aiohttp.client_exceptions import ClientError
-from aiohttp.hdrs import CONNECTION, KEEP_ALIVE
+from telegram import Bot, Update
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
+from telegram.ext import ApplicationBuilder, CallbackContext, TypeHandler
 
-from homeassistant.components.telegram_bot import (
-    initialize_bot,
-    CONF_ALLOWED_CHAT_IDS, BaseTelegramBotEntity,
-    PLATFORM_SCHEMA as TELEGRAM_PLATFORM_SCHEMA)
-from homeassistant.const import (
-    EVENT_HOMEASSISTANT_START, EVENT_HOMEASSISTANT_STOP)
-from homeassistant.core import callback
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.core import HomeAssistant
+
+from .bot import BaseTelegramBot, TelegramBotConfigEntry
+from .helpers import get_base_url
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORM_SCHEMA = TELEGRAM_PLATFORM_SCHEMA
-RETRY_SLEEP = 10
 
-
-class WrongHttpStatus(Exception):
-    """Thrown when a wrong http status is received."""
-
-    pass
-
-
-@asyncio.coroutine
-def async_setup_platform(hass, config):
+async def async_setup_bot_platform(
+    hass: HomeAssistant, bot: Bot, config: TelegramBotConfigEntry
+) -> BaseTelegramBot | None:
     """Set up the Telegram polling platform."""
-    bot = initialize_bot(config)
-    pol = TelegramPoll(bot, hass, config[CONF_ALLOWED_CHAT_IDS])
+    pollbot = PollBot(hass, bot, config)
 
-    @callback
-    def _start_bot(_event):
-        """Start the bot."""
-        pol.start_polling()
+    await pollbot.start_polling()
 
-    @callback
-    def _stop_bot(_event):
-        """Stop the bot."""
-        pol.stop_polling()
-
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_START, _start_bot)
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _stop_bot)
-
-    return True
+    return pollbot
 
 
-class TelegramPoll(BaseTelegramBotEntity):
-    """Asyncio telegram incoming message handler."""
+async def process_error(bot: Bot, update: object, context: CallbackContext) -> None:
+    """Telegram bot error handler."""
+    if context.error:
+        error_callback(bot, context.error, update)
 
-    def __init__(self, bot, hass, allowed_chat_ids):
-        """Initialize the polling instance."""
-        BaseTelegramBotEntity.__init__(self, hass, allowed_chat_ids)
-        self.update_id = 0
-        self.websession = async_get_clientsession(hass)
-        self.update_url = '{0}/getUpdates'.format(bot.base_url)
-        self.polling_task = None  # The actual polling task.
-        self.timeout = 15  # async post timeout
-        # Polling timeout should always be less than async post timeout.
-        self.post_data = {'timeout': self.timeout - 5}
 
-    def start_polling(self):
+def error_callback(bot: Bot, error: Exception, update: object | None = None) -> None:
+    """Log the error."""
+    try:
+        raise error
+    except TimedOut, NetworkError, RetryAfter:
+        # Long polling timeout or connection problem. Nothing serious.
+        pass
+    except TelegramError:
+        if update is not None:
+            _LOGGER.error(
+                '[%s %s] Update "%s" caused error: "%s"',
+                bot.username,
+                bot.id,
+                update,
+                error,
+            )
+        else:
+            _LOGGER.error(
+                "[%s %s] %s: %s", bot.username, bot.id, error.__class__.__name__, error
+            )
+
+
+class PollBot(BaseTelegramBot):
+    """Controls the Application object that holds the bot and an updater.
+
+    The application is set up to pass telegram updates to `self.handle_update`
+    """
+
+    def __init__(
+        self, hass: HomeAssistant, bot: Bot, config: TelegramBotConfigEntry
+    ) -> None:
+        """Create Application to poll for updates."""
+        super().__init__(hass, config, bot)
+        self.bot = bot
+        self.application = ApplicationBuilder().bot(self.bot).build()
+        self.application.add_handler(TypeHandler(Update, self.handle_update))
+        self.application.add_error_handler(
+            lambda update, context: process_error(self.bot, update, context)
+        )
+
+    async def shutdown(self) -> None:
+        """Shutdown the app."""
+        await self.stop_polling()
+
+    async def start_polling(self) -> None:
         """Start the polling task."""
-        self.polling_task = self.hass.async_add_job(self.check_incoming())
+        await self.application.initialize()
+        if self.application.updater:
+            await self.application.updater.start_polling(
+                error_callback=lambda error: error_callback(self.bot, error, None)
+            )
+        await self.application.start()
+        _LOGGER.info(
+            "[%s %s] Started polling at %s",
+            self.bot.username,
+            self.bot.id,
+            get_base_url(self.bot),
+        )
 
-    def stop_polling(self):
+    async def stop_polling(self) -> None:
         """Stop the polling task."""
-        self.polling_task.cancel()
-
-    @asyncio.coroutine
-    def get_updates(self, offset):
-        """Bypass the default long polling method to enable asyncio."""
-        resp = None
-        if offset:
-            self.post_data['offset'] = offset
-        try:
-            with async_timeout.timeout(self.timeout, loop=self.hass.loop):
-                resp = yield from self.websession.post(
-                    self.update_url, data=self.post_data,
-                    headers={CONNECTION: KEEP_ALIVE}
-                )
-            if resp.status == 200:
-                _json = yield from resp.json()
-                return _json
-            else:
-                raise WrongHttpStatus('wrong status {}'.format(resp.status))
-        finally:
-            if resp is not None:
-                yield from resp.release()
-
-    @asyncio.coroutine
-    def check_incoming(self):
-        """Continuously check for incoming telegram messages."""
-        try:
-            while True:
-                try:
-                    _updates = yield from self.get_updates(self.update_id)
-                except (WrongHttpStatus, ClientError) as err:
-                    # WrongHttpStatus: Non-200 status code.
-                    # Occurs at times (mainly 502) and recovers
-                    # automatically. Pause for a while before retrying.
-                    _LOGGER.error(err)
-                    yield from asyncio.sleep(RETRY_SLEEP)
-                except (asyncio.TimeoutError, ValueError):
-                    # Long polling timeout. Nothing serious.
-                    # Json error. Just retry for the next message.
-                    pass
-                else:
-                    # no exception raised. update received data.
-                    _updates = _updates.get('result')
-                    if _updates is None:
-                        _LOGGER.error("Incorrect result received.")
-                    else:
-                        for update in _updates:
-                            self.update_id = update['update_id'] + 1
-                            self.process_message(update)
-        except CancelledError:
-            _LOGGER.debug("Stopping Telegram polling bot")
+        if self.application.updater:
+            await self.application.updater.stop()
+        await self.application.stop()
+        await self.application.shutdown()
+        _LOGGER.info("[%s %s] Stopped polling", self.bot.username, self.bot.id)

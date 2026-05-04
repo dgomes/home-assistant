@@ -1,369 +1,436 @@
-"""
-Support for Cover devices.
+"""Support for Cover devices."""
 
-For more details about this platform, please refer to the documentation at
-https://home-assistant.io/components/cover/
-"""
-import asyncio
+from collections.abc import Callable
 from datetime import timedelta
 import functools as ft
 import logging
+from typing import Any, final
 
+from propcache.api import cached_property
 import voluptuous as vol
 
-from homeassistant.loader import bind_hass
-from homeassistant.helpers.entity_component import EntityComponent
-from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.config_validation import PLATFORM_SCHEMA  # noqa
-import homeassistant.helpers.config_validation as cv
-from homeassistant.components import group
-from homeassistant.helpers import intent
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    SERVICE_OPEN_COVER, SERVICE_CLOSE_COVER, SERVICE_SET_COVER_POSITION,
-    SERVICE_STOP_COVER, SERVICE_OPEN_COVER_TILT, SERVICE_CLOSE_COVER_TILT,
-    SERVICE_STOP_COVER_TILT, SERVICE_SET_COVER_TILT_POSITION, STATE_OPEN,
-    STATE_CLOSED, STATE_UNKNOWN, STATE_OPENING, STATE_CLOSING, ATTR_ENTITY_ID)
+    SERVICE_CLOSE_COVER,
+    SERVICE_CLOSE_COVER_TILT,
+    SERVICE_OPEN_COVER,
+    SERVICE_OPEN_COVER_TILT,
+    SERVICE_SET_COVER_POSITION,
+    SERVICE_SET_COVER_TILT_POSITION,
+    SERVICE_STOP_COVER,
+    SERVICE_STOP_COVER_TILT,
+    SERVICE_TOGGLE,
+    SERVICE_TOGGLE_COVER_TILT,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.entity import Entity, EntityDescription
+from homeassistant.helpers.entity_component import EntityComponent
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.util.hass_dict import HassKey
+
+from .condition import make_cover_is_closed_condition, make_cover_is_open_condition
+from .const import (
+    ATTR_CURRENT_POSITION,
+    ATTR_CURRENT_TILT_POSITION,
+    ATTR_IS_CLOSED,
+    ATTR_POSITION,
+    ATTR_TILT_POSITION,
+    DOMAIN,
+    INTENT_CLOSE_COVER,
+    INTENT_OPEN_COVER,
+    CoverDeviceClass,
+    CoverEntityFeature,
+    CoverState,
+)
+from .trigger import make_cover_closed_trigger, make_cover_opened_trigger
 
 _LOGGER = logging.getLogger(__name__)
 
-DOMAIN = 'cover'
-DEPENDENCIES = ['group']
+DATA_COMPONENT: HassKey[EntityComponent[CoverEntity]] = HassKey(DOMAIN)
+ENTITY_ID_FORMAT = DOMAIN + ".{}"
+PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA
+PLATFORM_SCHEMA_BASE = cv.PLATFORM_SCHEMA_BASE
 SCAN_INTERVAL = timedelta(seconds=15)
 
-GROUP_NAME_ALL_COVERS = 'all covers'
-ENTITY_ID_ALL_COVERS = group.ENTITY_ID_FORMAT.format('all_covers')
+DEVICE_CLASSES_SCHEMA = vol.All(vol.Lower, vol.Coerce(CoverDeviceClass))
+DEVICE_CLASSES = [cls.value for cls in CoverDeviceClass]
 
-ENTITY_ID_FORMAT = DOMAIN + '.{}'
+# mypy: disallow-any-generics
 
-DEVICE_CLASSES = [
-    'window',        # Window control
-    'garage',        # Garage door control
+
+__all__ = [
+    "ATTR_CURRENT_POSITION",
+    "ATTR_CURRENT_TILT_POSITION",
+    "ATTR_IS_CLOSED",
+    "ATTR_POSITION",
+    "ATTR_TILT_POSITION",
+    "DEVICE_CLASSES",
+    "DEVICE_CLASSES_SCHEMA",
+    "DOMAIN",
+    "INTENT_CLOSE_COVER",
+    "INTENT_OPEN_COVER",
+    "PLATFORM_SCHEMA",
+    "PLATFORM_SCHEMA_BASE",
+    "CoverDeviceClass",
+    "CoverEntity",
+    "CoverEntityDescription",
+    "CoverEntityFeature",
+    "CoverState",
+    "make_cover_closed_trigger",
+    "make_cover_is_closed_condition",
+    "make_cover_is_open_condition",
+    "make_cover_opened_trigger",
 ]
 
-DEVICE_CLASSES_SCHEMA = vol.All(vol.Lower, vol.In(DEVICE_CLASSES))
 
-SUPPORT_OPEN = 1
-SUPPORT_CLOSE = 2
-SUPPORT_SET_POSITION = 4
-SUPPORT_STOP = 8
-SUPPORT_OPEN_TILT = 16
-SUPPORT_CLOSE_TILT = 32
-SUPPORT_STOP_TILT = 64
-SUPPORT_SET_TILT_POSITION = 128
-
-ATTR_CURRENT_POSITION = 'current_position'
-ATTR_CURRENT_TILT_POSITION = 'current_tilt_position'
-ATTR_POSITION = 'position'
-ATTR_TILT_POSITION = 'tilt_position'
-
-INTENT_OPEN_COVER = 'HassOpenCover'
-INTENT_CLOSE_COVER = 'HassCloseCover'
-
-COVER_SERVICE_SCHEMA = vol.Schema({
-    vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
-})
-
-COVER_SET_COVER_POSITION_SCHEMA = COVER_SERVICE_SCHEMA.extend({
-    vol.Required(ATTR_POSITION):
-        vol.All(vol.Coerce(int), vol.Range(min=0, max=100)),
-})
-
-COVER_SET_COVER_TILT_POSITION_SCHEMA = COVER_SERVICE_SCHEMA.extend({
-    vol.Required(ATTR_TILT_POSITION):
-        vol.All(vol.Coerce(int), vol.Range(min=0, max=100)),
-})
-
-SERVICE_TO_METHOD = {
-    SERVICE_OPEN_COVER: {'method': 'async_open_cover'},
-    SERVICE_CLOSE_COVER: {'method': 'async_close_cover'},
-    SERVICE_SET_COVER_POSITION: {
-        'method': 'async_set_cover_position',
-        'schema': COVER_SET_COVER_POSITION_SCHEMA},
-    SERVICE_STOP_COVER: {'method': 'async_stop_cover'},
-    SERVICE_OPEN_COVER_TILT: {'method': 'async_open_cover_tilt'},
-    SERVICE_CLOSE_COVER_TILT: {'method': 'async_close_cover_tilt'},
-    SERVICE_STOP_COVER_TILT: {'method': 'async_stop_cover_tilt'},
-    SERVICE_SET_COVER_TILT_POSITION: {
-        'method': 'async_set_cover_tilt_position',
-        'schema': COVER_SET_COVER_TILT_POSITION_SCHEMA},
-}
-
-
-@bind_hass
-def is_closed(hass, entity_id=None):
+def is_closed(hass: HomeAssistant, entity_id: str) -> bool:
     """Return if the cover is closed based on the statemachine."""
-    entity_id = entity_id or ENTITY_ID_ALL_COVERS
-    return hass.states.is_state(entity_id, STATE_CLOSED)
+    return hass.states.is_state(entity_id, CoverState.CLOSED)
 
 
-@bind_hass
-def open_cover(hass, entity_id=None):
-    """Open all or specified cover."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else None
-    hass.services.call(DOMAIN, SERVICE_OPEN_COVER, data)
-
-
-@bind_hass
-def close_cover(hass, entity_id=None):
-    """Close all or specified cover."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else None
-    hass.services.call(DOMAIN, SERVICE_CLOSE_COVER, data)
-
-
-@bind_hass
-def set_cover_position(hass, position, entity_id=None):
-    """Move to specific position all or specified cover."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
-    data[ATTR_POSITION] = position
-    hass.services.call(DOMAIN, SERVICE_SET_COVER_POSITION, data)
-
-
-@bind_hass
-def stop_cover(hass, entity_id=None):
-    """Stop all or specified cover."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else None
-    hass.services.call(DOMAIN, SERVICE_STOP_COVER, data)
-
-
-@bind_hass
-def open_cover_tilt(hass, entity_id=None):
-    """Open all or specified cover tilt."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else None
-    hass.services.call(DOMAIN, SERVICE_OPEN_COVER_TILT, data)
-
-
-@bind_hass
-def close_cover_tilt(hass, entity_id=None):
-    """Close all or specified cover tilt."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else None
-    hass.services.call(DOMAIN, SERVICE_CLOSE_COVER_TILT, data)
-
-
-@bind_hass
-def set_cover_tilt_position(hass, tilt_position, entity_id=None):
-    """Move to specific tilt position all or specified cover."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
-    data[ATTR_TILT_POSITION] = tilt_position
-    hass.services.call(DOMAIN, SERVICE_SET_COVER_TILT_POSITION, data)
-
-
-@bind_hass
-def stop_cover_tilt(hass, entity_id=None):
-    """Stop all or specified cover tilt."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else None
-    hass.services.call(DOMAIN, SERVICE_STOP_COVER_TILT, data)
-
-
-async def async_setup(hass, config):
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Track states and offer events for covers."""
-    component = EntityComponent(
-        _LOGGER, DOMAIN, hass, SCAN_INTERVAL, GROUP_NAME_ALL_COVERS)
+    component = hass.data[DATA_COMPONENT] = EntityComponent[CoverEntity](
+        _LOGGER, DOMAIN, hass, SCAN_INTERVAL
+    )
 
     await component.async_setup(config)
 
-    async def async_handle_cover_service(service):
-        """Handle calls to the cover services."""
-        covers = component.async_extract_from_service(service)
-        method = SERVICE_TO_METHOD.get(service.service)
-        params = service.data.copy()
-        params.pop(ATTR_ENTITY_ID, None)
+    component.async_register_entity_service(
+        SERVICE_OPEN_COVER, None, "async_open_cover", [CoverEntityFeature.OPEN]
+    )
 
-        # call method
-        update_tasks = []
-        for cover in covers:
-            await getattr(cover, method['method'])(**params)
-            if not cover.should_poll:
-                continue
-            update_tasks.append(cover.async_update_ha_state(True))
+    component.async_register_entity_service(
+        SERVICE_CLOSE_COVER, None, "async_close_cover", [CoverEntityFeature.CLOSE]
+    )
 
-        if update_tasks:
-            await asyncio.wait(update_tasks, loop=hass.loop)
+    component.async_register_entity_service(
+        SERVICE_SET_COVER_POSITION,
+        {
+            vol.Required(ATTR_POSITION): vol.All(
+                vol.Coerce(int), vol.Range(min=0, max=100)
+            )
+        },
+        "async_set_cover_position",
+        [CoverEntityFeature.SET_POSITION],
+    )
 
-    for service_name in SERVICE_TO_METHOD:
-        schema = SERVICE_TO_METHOD[service_name].get(
-            'schema', COVER_SERVICE_SCHEMA)
-        hass.services.async_register(
-            DOMAIN, service_name, async_handle_cover_service,
-            schema=schema)
-    hass.helpers.intent.async_register(intent.ServiceIntentHandler(
-        INTENT_OPEN_COVER, DOMAIN, SERVICE_OPEN_COVER,
-        "Opened {}"))
-    hass.helpers.intent.async_register(intent.ServiceIntentHandler(
-        INTENT_CLOSE_COVER, DOMAIN, SERVICE_CLOSE_COVER,
-        "Closed {}"))
+    component.async_register_entity_service(
+        SERVICE_STOP_COVER, None, "async_stop_cover", [CoverEntityFeature.STOP]
+    )
+
+    component.async_register_entity_service(
+        SERVICE_TOGGLE,
+        None,
+        "async_toggle",
+        [CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE],
+    )
+
+    component.async_register_entity_service(
+        SERVICE_OPEN_COVER_TILT,
+        None,
+        "async_open_cover_tilt",
+        [CoverEntityFeature.OPEN_TILT],
+    )
+
+    component.async_register_entity_service(
+        SERVICE_CLOSE_COVER_TILT,
+        None,
+        "async_close_cover_tilt",
+        [CoverEntityFeature.CLOSE_TILT],
+    )
+
+    component.async_register_entity_service(
+        SERVICE_STOP_COVER_TILT,
+        None,
+        "async_stop_cover_tilt",
+        [CoverEntityFeature.STOP_TILT],
+    )
+
+    component.async_register_entity_service(
+        SERVICE_SET_COVER_TILT_POSITION,
+        {
+            vol.Required(ATTR_TILT_POSITION): vol.All(
+                vol.Coerce(int), vol.Range(min=0, max=100)
+            )
+        },
+        "async_set_cover_tilt_position",
+        [CoverEntityFeature.SET_TILT_POSITION],
+    )
+
+    component.async_register_entity_service(
+        SERVICE_TOGGLE_COVER_TILT,
+        None,
+        "async_toggle_tilt",
+        [CoverEntityFeature.OPEN_TILT | CoverEntityFeature.CLOSE_TILT],
+    )
 
     return True
 
 
-class CoverDevice(Entity):
-    """Representation a cover."""
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up a config entry."""
+    return await hass.data[DATA_COMPONENT].async_setup_entry(entry)
 
-    # pylint: disable=no-self-use
-    @property
-    def current_cover_position(self):
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    return await hass.data[DATA_COMPONENT].async_unload_entry(entry)
+
+
+class CoverEntityDescription(EntityDescription, frozen_or_thawed=True):
+    """A class that describes cover entities."""
+
+    device_class: CoverDeviceClass | None = None
+
+
+CACHED_PROPERTIES_WITH_ATTR_ = {
+    "current_cover_position",
+    "current_cover_tilt_position",
+    "device_class",
+    "is_opening",
+    "is_closing",
+    "is_closed",
+}
+
+
+class CoverEntity(Entity, cached_properties=CACHED_PROPERTIES_WITH_ATTR_):
+    """Base class for cover entities."""
+
+    entity_description: CoverEntityDescription
+    _attr_current_cover_position: int | None = None
+    _attr_current_cover_tilt_position: int | None = None
+    _attr_device_class: CoverDeviceClass | None
+    _attr_is_closed: bool | None
+    _attr_is_closing: bool | None = None
+    _attr_is_opening: bool | None = None
+    _attr_state: None = None
+    _attr_supported_features: CoverEntityFeature | None
+
+    _cover_is_last_toggle_direction_open = True
+
+    @cached_property
+    def current_cover_position(self) -> int | None:
         """Return current position of cover.
 
         None is unknown, 0 is closed, 100 is fully open.
         """
-        pass
+        return self._attr_current_cover_position
 
-    @property
-    def current_cover_tilt_position(self):
+    @cached_property
+    def current_cover_tilt_position(self) -> int | None:
         """Return current position of cover tilt.
 
         None is unknown, 0 is closed, 100 is fully open.
         """
-        pass
+        return self._attr_current_cover_tilt_position
+
+    @cached_property
+    def device_class(self) -> CoverDeviceClass | None:
+        """Return the class of this entity."""
+        if hasattr(self, "_attr_device_class"):
+            return self._attr_device_class
+        if hasattr(self, "entity_description"):
+            return self.entity_description.device_class
+        return None
 
     @property
-    def state(self):
+    @final
+    def state(self) -> str | None:
         """Return the state of the cover."""
         if self.is_opening:
-            return STATE_OPENING
+            self._cover_is_last_toggle_direction_open = True
+            return CoverState.OPENING
         if self.is_closing:
-            return STATE_CLOSING
+            self._cover_is_last_toggle_direction_open = False
+            return CoverState.CLOSING
 
-        closed = self.is_closed
+        if (closed := self.is_closed) is None:
+            return None
 
-        if closed is None:
-            return STATE_UNKNOWN
+        return CoverState.CLOSED if closed else CoverState.OPEN
 
-        return STATE_CLOSED if closed else STATE_OPEN
-
+    @final
     @property
-    def state_attributes(self):
+    def state_attributes(self) -> dict[str, Any]:
         """Return the state attributes."""
-        data = {}
+        data: dict[str, Any] = {}
 
-        current = self.current_cover_position
-        if current is not None:
-            data[ATTR_CURRENT_POSITION] = self.current_cover_position
+        data[ATTR_IS_CLOSED] = self.is_closed
 
-        current_tilt = self.current_cover_tilt_position
-        if current_tilt is not None:
-            data[ATTR_CURRENT_TILT_POSITION] = self.current_cover_tilt_position
+        if (current := self.current_cover_position) is not None:
+            data[ATTR_CURRENT_POSITION] = current
+
+        if (current_tilt := self.current_cover_tilt_position) is not None:
+            data[ATTR_CURRENT_TILT_POSITION] = current_tilt
 
         return data
 
     @property
-    def supported_features(self):
+    def supported_features(self) -> CoverEntityFeature:
         """Flag supported features."""
-        supported_features = SUPPORT_OPEN | SUPPORT_CLOSE | SUPPORT_STOP
+        if (features := self._attr_supported_features) is not None:
+            return features
+
+        supported_features = (
+            CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE | CoverEntityFeature.STOP
+        )
 
         if self.current_cover_position is not None:
-            supported_features |= SUPPORT_SET_POSITION
+            supported_features |= CoverEntityFeature.SET_POSITION
 
         if self.current_cover_tilt_position is not None:
             supported_features |= (
-                SUPPORT_OPEN_TILT | SUPPORT_CLOSE_TILT | SUPPORT_STOP_TILT |
-                SUPPORT_SET_TILT_POSITION)
+                CoverEntityFeature.OPEN_TILT
+                | CoverEntityFeature.CLOSE_TILT
+                | CoverEntityFeature.STOP_TILT
+                | CoverEntityFeature.SET_TILT_POSITION
+            )
 
         return supported_features
 
-    @property
-    def is_opening(self):
+    @cached_property
+    def is_opening(self) -> bool | None:
         """Return if the cover is opening or not."""
-        pass
+        return self._attr_is_opening
 
-    @property
-    def is_closing(self):
+    @cached_property
+    def is_closing(self) -> bool | None:
         """Return if the cover is closing or not."""
-        pass
+        return self._attr_is_closing
 
-    @property
-    def is_closed(self):
+    @cached_property
+    def is_closed(self) -> bool | None:
         """Return if the cover is closed or not."""
-        raise NotImplementedError()
+        return self._attr_is_closed
 
-    def open_cover(self, **kwargs):
+    def open_cover(self, **kwargs: Any) -> None:
         """Open the cover."""
-        raise NotImplementedError()
+        raise NotImplementedError
 
-    def async_open_cover(self, **kwargs):
-        """Open the cover.
+    async def async_open_cover(self, **kwargs: Any) -> None:
+        """Open the cover."""
+        await self.hass.async_add_executor_job(ft.partial(self.open_cover, **kwargs))
 
-        This method must be run in the event loop and returns a coroutine.
-        """
-        return self.hass.async_add_job(ft.partial(self.open_cover, **kwargs))
-
-    def close_cover(self, **kwargs):
+    def close_cover(self, **kwargs: Any) -> None:
         """Close cover."""
-        raise NotImplementedError()
+        raise NotImplementedError
 
-    def async_close_cover(self, **kwargs):
-        """Close cover.
+    async def async_close_cover(self, **kwargs: Any) -> None:
+        """Close cover."""
+        await self.hass.async_add_executor_job(ft.partial(self.close_cover, **kwargs))
 
-        This method must be run in the event loop and returns a coroutine.
-        """
-        return self.hass.async_add_job(ft.partial(self.close_cover, **kwargs))
+    def toggle(self, **kwargs: Any) -> None:
+        """Toggle the entity."""
+        fns = {
+            "open": self.open_cover,
+            "close": self.close_cover,
+            "stop": self.stop_cover,
+        }
+        function = self._get_toggle_function(fns)
+        function(**kwargs)
 
-    def set_cover_position(self, **kwargs):
+    async def async_toggle(self, **kwargs: Any) -> None:
+        """Toggle the entity."""
+        fns = {
+            "open": self.async_open_cover,
+            "close": self.async_close_cover,
+            "stop": self.async_stop_cover,
+        }
+        function = self._get_toggle_function(fns)
+        await function(**kwargs)
+
+    def set_cover_position(self, **kwargs: Any) -> None:
         """Move the cover to a specific position."""
-        pass
 
-    def async_set_cover_position(self, **kwargs):
-        """Move the cover to a specific position.
+    async def async_set_cover_position(self, **kwargs: Any) -> None:
+        """Move the cover to a specific position."""
+        await self.hass.async_add_executor_job(
+            ft.partial(self.set_cover_position, **kwargs)
+        )
 
-        This method must be run in the event loop and returns a coroutine.
-        """
-        return self.hass.async_add_job(
-            ft.partial(self.set_cover_position, **kwargs))
-
-    def stop_cover(self, **kwargs):
+    def stop_cover(self, **kwargs: Any) -> None:
         """Stop the cover."""
-        pass
 
-    def async_stop_cover(self, **kwargs):
-        """Stop the cover.
+    async def async_stop_cover(self, **kwargs: Any) -> None:
+        """Stop the cover."""
+        await self.hass.async_add_executor_job(ft.partial(self.stop_cover, **kwargs))
 
-        This method must be run in the event loop and returns a coroutine.
-        """
-        return self.hass.async_add_job(ft.partial(self.stop_cover, **kwargs))
-
-    def open_cover_tilt(self, **kwargs):
+    def open_cover_tilt(self, **kwargs: Any) -> None:
         """Open the cover tilt."""
-        pass
 
-    def async_open_cover_tilt(self, **kwargs):
-        """Open the cover tilt.
+    async def async_open_cover_tilt(self, **kwargs: Any) -> None:
+        """Open the cover tilt."""
+        await self.hass.async_add_executor_job(
+            ft.partial(self.open_cover_tilt, **kwargs)
+        )
 
-        This method must be run in the event loop and returns a coroutine.
-        """
-        return self.hass.async_add_job(
-            ft.partial(self.open_cover_tilt, **kwargs))
-
-    def close_cover_tilt(self, **kwargs):
+    def close_cover_tilt(self, **kwargs: Any) -> None:
         """Close the cover tilt."""
-        pass
 
-    def async_close_cover_tilt(self, **kwargs):
-        """Close the cover tilt.
+    async def async_close_cover_tilt(self, **kwargs: Any) -> None:
+        """Close the cover tilt."""
+        await self.hass.async_add_executor_job(
+            ft.partial(self.close_cover_tilt, **kwargs)
+        )
 
-        This method must be run in the event loop and returns a coroutine.
-        """
-        return self.hass.async_add_job(
-            ft.partial(self.close_cover_tilt, **kwargs))
-
-    def set_cover_tilt_position(self, **kwargs):
+    def set_cover_tilt_position(self, **kwargs: Any) -> None:
         """Move the cover tilt to a specific position."""
-        pass
 
-    def async_set_cover_tilt_position(self, **kwargs):
-        """Move the cover tilt to a specific position.
+    async def async_set_cover_tilt_position(self, **kwargs: Any) -> None:
+        """Move the cover tilt to a specific position."""
+        await self.hass.async_add_executor_job(
+            ft.partial(self.set_cover_tilt_position, **kwargs)
+        )
 
-        This method must be run in the event loop and returns a coroutine.
-        """
-        return self.hass.async_add_job(
-            ft.partial(self.set_cover_tilt_position, **kwargs))
-
-    def stop_cover_tilt(self, **kwargs):
+    def stop_cover_tilt(self, **kwargs: Any) -> None:
         """Stop the cover."""
-        pass
 
-    def async_stop_cover_tilt(self, **kwargs):
-        """Stop the cover.
+    async def async_stop_cover_tilt(self, **kwargs: Any) -> None:
+        """Stop the cover."""
+        await self.hass.async_add_executor_job(
+            ft.partial(self.stop_cover_tilt, **kwargs)
+        )
 
-        This method must be run in the event loop and returns a coroutine.
-        """
-        return self.hass.async_add_job(
-            ft.partial(self.stop_cover_tilt, **kwargs))
+    def toggle_tilt(self, **kwargs: Any) -> None:
+        """Toggle the entity."""
+        if self.current_cover_tilt_position == 0:
+            self.open_cover_tilt(**kwargs)
+        else:
+            self.close_cover_tilt(**kwargs)
+
+    async def async_toggle_tilt(self, **kwargs: Any) -> None:
+        """Toggle the entity."""
+        if self.current_cover_tilt_position == 0:
+            await self.async_open_cover_tilt(**kwargs)
+        else:
+            await self.async_close_cover_tilt(**kwargs)
+
+    def _get_toggle_function[**_P, _R](
+        self, fns: dict[str, Callable[_P, _R]]
+    ) -> Callable[_P, _R]:
+        # If we are opening or closing and we support stopping, then we should stop
+        if self.supported_features & CoverEntityFeature.STOP and (
+            self.is_closing or self.is_opening
+        ):
+            return fns["stop"]
+
+        # If we are fully closed or in the process of closing, then we should open
+        if self.is_closed or self.is_closing:
+            return fns["open"]
+
+        # If we are fully open or in the process of opening, then we should close
+        if self.current_cover_position == 100 or self.is_opening:
+            return fns["close"]
+
+        # We are any of:
+        # * fully open but do not report `current_cover_position`
+        # * stopped partially open
+        # * either opening or closing, but do not report them
+        # If we previously reported opening/closing, we should move in the opposite direction.
+        # Otherwise, we must assume we are (partially) open and should always close.
+        # Note: _cover_is_last_toggle_direction_open will always remain True if we never report opening/closing.
+        return (
+            fns["close"] if self._cover_is_last_toggle_direction_open else fns["open"]
+        )

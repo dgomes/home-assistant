@@ -1,309 +1,479 @@
-"""
-Component to integrate the Home Assistant cloud.
+"""Component to integrate the Home Assistant cloud."""
 
-For more details about this component, please refer to the documentation at
-https://home-assistant.io/components/cloud/
-"""
 import asyncio
-from datetime import datetime
-import json
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
+from datetime import datetime, timedelta
+from enum import Enum
 import logging
-import os
+from typing import Any, cast
 
-import aiohttp
-import async_timeout
+from hass_nabucasa import Cloud, NabuCasaBaseError
 import voluptuous as vol
 
+from homeassistant.components import alexa, google_assistant
+from homeassistant.config_entries import SOURCE_SYSTEM, ConfigEntry
 from homeassistant.const import (
-    EVENT_HOMEASSISTANT_START, CONF_REGION, CONF_MODE, CONF_NAME)
-from homeassistant.helpers import entityfilter, config_validation as cv
+    CONF_DESCRIPTION,
+    CONF_MODE,
+    CONF_NAME,
+    CONF_REGION,
+    EVENT_HOMEASSISTANT_STOP,
+    FORMAT_DATETIME,
+    Platform,
+)
+from homeassistant.core import Event, HassJob, HomeAssistant, ServiceCall, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_validation as cv, entityfilter
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.util import dt as dt_util
-from homeassistant.components.alexa import smart_home as alexa_sh
-from homeassistant.components.google_assistant import helpers as ga_h
-from homeassistant.components.google_assistant import const as ga_c
+from homeassistant.helpers.discovery import async_load_platform
+from homeassistant.helpers.dispatcher import (
+    async_dispatcher_connect,
+    async_dispatcher_send,
+)
+from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.service import async_register_admin_service
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.loader import async_get_integration
+from homeassistant.util.signal_type import SignalType
 
-from . import http_api, iot
-from .const import CONFIG_DIR, DOMAIN, SERVERS
+# Pre-import backup to avoid it being imported
+# later when the import executor is busy and delaying
+# startup
+from . import (
+    account_link,
+    backup,  # noqa: F401
+    http_api,
+)
+from .client import CloudClient
+from .const import (
+    CONF_ACCOUNT_LINK_SERVER,
+    CONF_ACME_SERVER,
+    CONF_ALEXA,
+    CONF_ALIASES,
+    CONF_API_SERVER,
+    CONF_COGNITO_CLIENT_ID,
+    CONF_DISCOVERY_SERVICE_ACTIONS,
+    CONF_ENTITY_CONFIG,
+    CONF_FILTER,
+    CONF_GOOGLE_ACTIONS,
+    CONF_RELAYER_SERVER,
+    CONF_REMOTESTATE_SERVER,
+    CONF_SERVICEHANDLERS_SERVER,
+    CONF_USER_POOL_ID,
+    DATA_CLOUD,
+    DATA_CLOUD_LOG_HANDLER,
+    DATA_PLATFORMS_SETUP,
+    DOMAIN,
+    MODE_DEV,
+    MODE_PROD,
+)
+from .helpers import FixedSizeQueueLogHandler
+from .prefs import CloudPreferences
+from .repairs import async_manage_legacy_subscription_issue
+from .subscription import async_subscription_info
 
-REQUIREMENTS = ['warrant==0.6.1']
+DEFAULT_MODE = MODE_PROD
 
-_LOGGER = logging.getLogger(__name__)
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.STT,
+    Platform.TTS,
+]
 
-CONF_ALEXA = 'alexa'
-CONF_ALIASES = 'aliases'
-CONF_COGNITO_CLIENT_ID = 'cognito_client_id'
-CONF_ENTITY_CONFIG = 'entity_config'
-CONF_FILTER = 'filter'
-CONF_GOOGLE_ACTIONS = 'google_actions'
-CONF_RELAYER = 'relayer'
-CONF_USER_POOL_ID = 'user_pool_id'
-CONF_GOOGLE_ACTIONS_SYNC_URL = 'google_actions_sync_url'
+LLM_PLATFORMS = [
+    Platform.AI_TASK,
+    Platform.CONVERSATION,
+]
 
-DEFAULT_MODE = 'production'
-DEPENDENCIES = ['http']
+SERVICE_REMOTE_CONNECT = "remote_connect"
+SERVICE_REMOTE_DISCONNECT = "remote_disconnect"
 
-MODE_DEV = 'development'
+SIGNAL_CLOUD_CONNECTION_STATE: SignalType[CloudConnectionState] = SignalType(
+    "CLOUD_CONNECTION_STATE"
+)
 
-ALEXA_ENTITY_SCHEMA = vol.Schema({
-    vol.Optional(alexa_sh.CONF_DESCRIPTION): cv.string,
-    vol.Optional(alexa_sh.CONF_DISPLAY_CATEGORIES): cv.string,
-    vol.Optional(alexa_sh.CONF_NAME): cv.string,
-})
+_SIGNAL_CLOUDHOOKS_UPDATED: SignalType[dict[str, Any]] = SignalType(
+    "CLOUDHOOKS_UPDATED"
+)
 
-GOOGLE_ENTITY_SCHEMA = vol.Schema({
-    vol.Optional(CONF_NAME): cv.string,
-    vol.Optional(CONF_ALIASES): vol.All(cv.ensure_list, [cv.string]),
-    vol.Optional(ga_c.CONF_ROOM_HINT): cv.string,
-})
+STARTUP_REPAIR_DELAY = 1  # 1 hour
 
-ASSISTANT_SCHEMA = vol.Schema({
-    vol.Optional(CONF_FILTER, default={}): entityfilter.FILTER_SCHEMA,
-})
+ALEXA_ENTITY_SCHEMA = vol.Schema(
+    {
+        vol.Optional(CONF_DESCRIPTION): cv.string,
+        vol.Optional(alexa.CONF_DISPLAY_CATEGORIES): cv.string,
+        vol.Optional(CONF_NAME): cv.string,
+    }
+)
 
-ALEXA_SCHEMA = ASSISTANT_SCHEMA.extend({
-    vol.Optional(CONF_ENTITY_CONFIG): {cv.entity_id: ALEXA_ENTITY_SCHEMA}
-})
+GOOGLE_ENTITY_SCHEMA = vol.Schema(
+    {
+        vol.Optional(CONF_NAME): cv.string,
+        vol.Optional(CONF_ALIASES): vol.All(cv.ensure_list, [cv.string]),
+        vol.Optional(google_assistant.CONF_ROOM_HINT): cv.string,
+    }
+)
 
-GACTIONS_SCHEMA = ASSISTANT_SCHEMA.extend({
-    vol.Optional(CONF_ENTITY_CONFIG): {cv.entity_id: GOOGLE_ENTITY_SCHEMA}
-})
+ASSISTANT_SCHEMA = vol.Schema(
+    {vol.Optional(CONF_FILTER, default=dict): entityfilter.FILTER_SCHEMA}
+)
 
-CONFIG_SCHEMA = vol.Schema({
-    DOMAIN: vol.Schema({
-        vol.Optional(CONF_MODE, default=DEFAULT_MODE):
-            vol.In([MODE_DEV] + list(SERVERS)),
-        # Change to optional when we include real servers
+ALEXA_SCHEMA = ASSISTANT_SCHEMA.extend(
+    {vol.Optional(CONF_ENTITY_CONFIG): {cv.entity_id: ALEXA_ENTITY_SCHEMA}}
+)
+
+GACTIONS_SCHEMA = ASSISTANT_SCHEMA.extend(
+    {vol.Optional(CONF_ENTITY_CONFIG): {cv.entity_id: GOOGLE_ENTITY_SCHEMA}}
+)
+
+_BASE_CONFIG_SCHEMA = vol.Schema(
+    {
         vol.Optional(CONF_COGNITO_CLIENT_ID): str,
         vol.Optional(CONF_USER_POOL_ID): str,
         vol.Optional(CONF_REGION): str,
-        vol.Optional(CONF_RELAYER): str,
-        vol.Optional(CONF_GOOGLE_ACTIONS_SYNC_URL): str,
         vol.Optional(CONF_ALEXA): ALEXA_SCHEMA,
         vol.Optional(CONF_GOOGLE_ACTIONS): GACTIONS_SCHEMA,
-    }),
-}, extra=vol.ALLOW_EXTRA)
+        vol.Optional(CONF_ACCOUNT_LINK_SERVER): str,
+        vol.Optional(CONF_ACME_SERVER): str,
+        vol.Optional(CONF_API_SERVER): str,
+        vol.Optional(CONF_RELAYER_SERVER): str,
+        vol.Optional(CONF_REMOTESTATE_SERVER): str,
+        vol.Optional(CONF_SERVICEHANDLERS_SERVER): str,
+    }
+)
+
+CONFIG_SCHEMA = vol.Schema(
+    {
+        DOMAIN: vol.Any(
+            _BASE_CONFIG_SCHEMA.extend(
+                {
+                    vol.Required(CONF_MODE): vol.In([MODE_DEV]),
+                    vol.Required(CONF_API_SERVER): str,
+                    vol.Optional(CONF_DISCOVERY_SERVICE_ACTIONS): {str: cv.url},
+                }
+            ),
+            _BASE_CONFIG_SCHEMA.extend(
+                {
+                    vol.Optional(CONF_MODE, default=DEFAULT_MODE): vol.In([MODE_PROD]),
+                }
+            ),
+        )
+    },
+    extra=vol.ALLOW_EXTRA,
+)
 
 
-@asyncio.coroutine
-def async_setup(hass, config):
+class CloudNotAvailable(HomeAssistantError):
+    """Raised when an action requires the cloud but it's not available."""
+
+
+class CloudNotConnected(CloudNotAvailable):
+    """Raised when an action requires the cloud but it's not connected."""
+
+
+class CloudConnectionState(Enum):
+    """Cloud connection state."""
+
+    CLOUD_CONNECTED = "cloud_connected"
+    CLOUD_DISCONNECTED = "cloud_disconnected"
+
+
+@callback
+def async_is_logged_in(hass: HomeAssistant) -> bool:
+    """Test if user is logged in.
+
+    Note: This returns True even if not currently connected to the cloud.
+    """
+    return DATA_CLOUD in hass.data and hass.data[DATA_CLOUD].is_logged_in
+
+
+@callback
+def async_is_connected(hass: HomeAssistant) -> bool:
+    """Test if connected to the cloud."""
+    return DATA_CLOUD in hass.data and hass.data[DATA_CLOUD].iot.connected
+
+
+@callback
+def async_listen_connection_change(
+    hass: HomeAssistant,
+    target: Callable[[CloudConnectionState], Awaitable[None] | None],
+) -> Callable[[], None]:
+    """Notify on connection state changes."""
+    return async_dispatcher_connect(hass, SIGNAL_CLOUD_CONNECTION_STATE, target)
+
+
+@callback
+def async_active_subscription(hass: HomeAssistant) -> bool:
+    """Test if user has an active subscription."""
+    return async_is_logged_in(hass) and not hass.data[DATA_CLOUD].subscription_expired
+
+
+async def async_get_or_create_cloudhook(hass: HomeAssistant, webhook_id: str) -> str:
+    """Get or create a cloudhook."""
+    if not async_is_connected(hass):
+        raise CloudNotConnected
+
+    if not async_is_logged_in(hass):
+        raise CloudNotAvailable
+
+    cloud = hass.data[DATA_CLOUD]
+    cloudhooks = cloud.client.cloudhooks
+    if hook := cloudhooks.get(webhook_id):
+        return cast(str, hook["cloudhook_url"])
+
+    return await async_create_cloudhook(hass, webhook_id)
+
+
+async def async_create_cloudhook(hass: HomeAssistant, webhook_id: str) -> str:
+    """Create a cloudhook."""
+    if not async_is_connected(hass):
+        raise CloudNotConnected
+
+    if not async_is_logged_in(hass):
+        raise CloudNotAvailable
+
+    cloud = hass.data[DATA_CLOUD]
+    hook = await cloud.cloudhooks.async_create(webhook_id, True)
+    cloudhook_url: str = hook["cloudhook_url"]
+    return cloudhook_url
+
+
+async def async_delete_cloudhook(hass: HomeAssistant, webhook_id: str) -> None:
+    """Delete a cloudhook."""
+    if DATA_CLOUD not in hass.data:
+        raise CloudNotAvailable
+
+    await hass.data[DATA_CLOUD].cloudhooks.async_delete(webhook_id)
+
+
+@callback
+def async_listen_cloudhook_change(
+    hass: HomeAssistant,
+    webhook_id: str,
+    on_change: Callable[[dict[str, Any] | None], None],
+) -> Callable[[], None]:
+    """Listen for cloudhook changes for the given webhook and notify when modified or deleted."""
+
+    @callback
+    def _handle_cloudhooks_updated(cloudhooks: dict[str, Any]) -> None:
+        """Handle cloudhooks updated signal."""
+        on_change(cloudhooks.get(webhook_id))
+
+    return async_dispatcher_connect(
+        hass, _SIGNAL_CLOUDHOOKS_UPDATED, _handle_cloudhooks_updated
+    )
+
+
+@callback
+def async_remote_ui_url(hass: HomeAssistant) -> str:
+    """Get the remote UI URL."""
+    if not async_is_logged_in(hass):
+        raise CloudNotAvailable
+
+    if not hass.data[DATA_CLOUD].client.prefs.remote_enabled:
+        raise CloudNotAvailable
+
+    if not (remote_domain := hass.data[DATA_CLOUD].client.prefs.remote_domain):
+        raise CloudNotAvailable
+
+    return f"https://{remote_domain}"
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Initialize the Home Assistant cloud."""
+    log_handler = hass.data[DATA_CLOUD_LOG_HANDLER] = await _setup_log_handler(hass)
+
+    # Process configs
     if DOMAIN in config:
         kwargs = dict(config[DOMAIN])
     else:
         kwargs = {CONF_MODE: DEFAULT_MODE}
 
+    # Alexa/Google custom config
     alexa_conf = kwargs.pop(CONF_ALEXA, None) or ALEXA_SCHEMA({})
+    google_conf = kwargs.pop(CONF_GOOGLE_ACTIONS, None) or GACTIONS_SCHEMA({})
 
-    if CONF_GOOGLE_ACTIONS not in kwargs:
-        kwargs[CONF_GOOGLE_ACTIONS] = GACTIONS_SCHEMA({})
+    # Cloud settings
+    prefs = CloudPreferences(hass)
+    await prefs.async_initialize()
 
-    kwargs[CONF_ALEXA] = alexa_sh.Config(
-        should_expose=alexa_conf[CONF_FILTER],
-        entity_config=alexa_conf.get(CONF_ENTITY_CONFIG),
+    # Initialize Cloud
+    websession = async_get_clientsession(hass)
+    client = CloudClient(hass, prefs, websession, alexa_conf, google_conf)
+    cloud = hass.data[DATA_CLOUD] = Cloud(client, **kwargs)
+
+    async def _shutdown(event: Event) -> None:
+        """Shutdown event."""
+        await cloud.stop()
+        logging.root.removeHandler(log_handler)
+        del hass.data[DATA_CLOUD_LOG_HANDLER]
+
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _shutdown)
+
+    _handle_prefs_updated(hass, cloud)
+    _setup_services(hass, prefs)
+
+    async def async_startup_repairs(_: datetime) -> None:
+        """Create repair issues after startup."""
+        if not cloud.is_logged_in:
+            return
+
+        if subscription_info := await async_subscription_info(cloud):
+            async_manage_legacy_subscription_issue(hass, subscription_info)
+
+    loaded = False
+    stt_platform_loaded = asyncio.Event()
+    tts_platform_loaded = asyncio.Event()
+    stt_tts_entities_added = asyncio.Event()
+    hass.data[DATA_PLATFORMS_SETUP] = {
+        Platform.STT: stt_platform_loaded,
+        Platform.TTS: tts_platform_loaded,
+        "stt_tts_entities_added": stt_tts_entities_added,
+    }
+
+    async def _on_start() -> None:
+        """Handle cloud started after login."""
+        nonlocal loaded
+
+        # Prevent multiple discovery
+        if loaded:
+            return
+        loaded = True
+
+        await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": SOURCE_SYSTEM}
+        )
+
+    async def _on_connect() -> None:
+        """Handle cloud connect."""
+        async_dispatcher_send(
+            hass, SIGNAL_CLOUD_CONNECTION_STATE, CloudConnectionState.CLOUD_CONNECTED
+        )
+
+    async def _on_disconnect() -> None:
+        """Handle cloud disconnect."""
+        async_dispatcher_send(
+            hass, SIGNAL_CLOUD_CONNECTION_STATE, CloudConnectionState.CLOUD_DISCONNECTED
+        )
+
+    async def _on_initialized() -> None:
+        """Update preferences."""
+        await prefs.async_update(remote_domain=cloud.remote.instance_domain)
+
+    cloud.register_on_start(_on_start)
+    cloud.iot.register_on_connect(_on_connect)
+    cloud.iot.register_on_disconnect(_on_disconnect)
+    cloud.register_on_initialized(_on_initialized)
+
+    await cloud.initialize()
+    http_api.async_setup(hass)
+
+    account_link.async_setup(hass)
+
+    # Load legacy tts platform for backwards compatibility.
+    hass.async_create_task(
+        async_load_platform(
+            hass,
+            Platform.TTS,
+            DOMAIN,
+            {"platform_loaded": tts_platform_loaded},
+            config,
+        ),
+        eager_start=True,
     )
 
-    cloud = hass.data[DOMAIN] = Cloud(hass, **kwargs)
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_START, cloud.async_start)
-    yield from http_api.async_setup(hass)
+    async_call_later(
+        hass=hass,
+        delay=timedelta(hours=STARTUP_REPAIR_DELAY),
+        action=HassJob(
+            async_startup_repairs, "cloud startup repairs", cancel_on_shutdown=True
+        ),
+    )
+
     return True
 
 
-class Cloud:
-    """Store the configuration of the cloud connection."""
+@callback
+def _handle_prefs_updated(hass: HomeAssistant, cloud: Cloud[CloudClient]) -> None:
+    """Register handler for cloud preferences updates."""
+    cur_remote_enabled = cloud.client.prefs.remote_enabled
+    cur_cloudhooks = cloud.client.prefs.cloudhooks
+    lock = asyncio.Lock()
 
-    def __init__(self, hass, mode, alexa, google_actions,
-                 cognito_client_id=None, user_pool_id=None, region=None,
-                 relayer=None, google_actions_sync_url=None):
-        """Create an instance of Cloud."""
-        self.hass = hass
-        self.mode = mode
-        self.alexa_config = alexa
-        self._google_actions = google_actions
-        self._gactions_config = None
-        self.jwt_keyset = None
-        self.id_token = None
-        self.access_token = None
-        self.refresh_token = None
-        self.iot = iot.CloudIoT(self)
+    async def on_prefs_updated(prefs: CloudPreferences) -> None:
+        """Handle cloud preferences updates."""
+        nonlocal cur_remote_enabled
+        nonlocal cur_cloudhooks
 
-        if mode == MODE_DEV:
-            self.cognito_client_id = cognito_client_id
-            self.user_pool_id = user_pool_id
-            self.region = region
-            self.relayer = relayer
-            self.google_actions_sync_url = google_actions_sync_url
+        # Lock protects cur_ state variables from concurrent updates
+        async with lock:
+            if cur_cloudhooks != prefs.cloudhooks:
+                cur_cloudhooks = prefs.cloudhooks
+                async_dispatcher_send(hass, _SIGNAL_CLOUDHOOKS_UPDATED, cur_cloudhooks)
 
-        else:
-            info = SERVERS[mode]
+            if prefs.remote_enabled == cur_remote_enabled:
+                return
 
-            self.cognito_client_id = info['cognito_client_id']
-            self.user_pool_id = info['user_pool_id']
-            self.region = info['region']
-            self.relayer = info['relayer']
-            self.google_actions_sync_url = info['google_actions_sync_url']
+            if cur_remote_enabled := prefs.remote_enabled:
+                await cloud.remote.connect()
+            else:
+                await cloud.remote.disconnect()
 
-    @property
-    def is_logged_in(self):
-        """Get if cloud is logged in."""
-        return self.id_token is not None
+    cloud.client.prefs.async_listen_updates(on_prefs_updated)
 
-    @property
-    def subscription_expired(self):
-        """Return a boolean if the subscription has expired."""
-        return dt_util.utcnow() > self.expiration_date
 
-    @property
-    def expiration_date(self):
-        """Return the subscription expiration as a UTC datetime object."""
-        return datetime.combine(
-            dt_util.parse_date(self.claims['custom:sub-exp']),
-            datetime.min.time()).replace(tzinfo=dt_util.UTC)
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up a config entry."""
+    platforms = PLATFORMS.copy()
+    if (cloud := hass.data[DATA_CLOUD]).is_logged_in:
+        with suppress(NabuCasaBaseError):
+            await cloud.llm.async_ensure_token()
+            platforms += LLM_PLATFORMS
 
-    @property
-    def claims(self):
-        """Return the claims from the id token."""
-        return self._decode_claims(self.id_token)
+    await hass.config_entries.async_forward_entry_setups(entry, platforms)
+    entry.runtime_data = {"platforms": platforms}
+    stt_tts_entities_added = hass.data[DATA_PLATFORMS_SETUP]["stt_tts_entities_added"]
+    stt_tts_entities_added.set()
 
-    @property
-    def user_info_path(self):
-        """Get path to the stored auth."""
-        return self.path('{}_auth.json'.format(self.mode))
+    return True
 
-    @property
-    def gactions_config(self):
-        """Return the Google Assistant config."""
-        if self._gactions_config is None:
-            conf = self._google_actions
 
-            def should_expose(entity):
-                """If an entity should be exposed."""
-                return conf['filter'](entity.entity_id)
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    return await hass.config_entries.async_unload_platforms(
+        entry, entry.runtime_data["platforms"]
+    )
 
-            self._gactions_config = ga_h.Config(
-                should_expose=should_expose,
-                agent_user_id=self.claims['cognito:username'],
-                entity_config=conf.get(CONF_ENTITY_CONFIG),
-            )
 
-        return self._gactions_config
+@callback
+def _setup_services(hass: HomeAssistant, prefs: CloudPreferences) -> None:
+    """Set up services for cloud component."""
 
-    def path(self, *parts):
-        """Get config path inside cloud dir.
+    async def _service_handler(service: ServiceCall) -> None:
+        """Handle service for cloud."""
+        if service.service == SERVICE_REMOTE_CONNECT:
+            await prefs.async_update(remote_enabled=True)
+        elif service.service == SERVICE_REMOTE_DISCONNECT:
+            await prefs.async_update(remote_enabled=False)
 
-        Async friendly.
-        """
-        return self.hass.config.path(CONFIG_DIR, *parts)
+    async_register_admin_service(hass, DOMAIN, SERVICE_REMOTE_CONNECT, _service_handler)
+    async_register_admin_service(
+        hass, DOMAIN, SERVICE_REMOTE_DISCONNECT, _service_handler
+    )
 
-    @asyncio.coroutine
-    def logout(self):
-        """Close connection and remove all credentials."""
-        yield from self.iot.disconnect()
 
-        self.id_token = None
-        self.access_token = None
-        self.refresh_token = None
-        self._gactions_config = None
+async def _setup_log_handler(hass: HomeAssistant) -> FixedSizeQueueLogHandler:
+    fmt = (
+        "%(asctime)s.%(msecs)03d %(levelname)s (%(threadName)s) [%(name)s] %(message)s"
+    )
+    handler = FixedSizeQueueLogHandler()
+    handler.setFormatter(logging.Formatter(fmt, datefmt=FORMAT_DATETIME))
 
-        yield from self.hass.async_add_job(
-            lambda: os.remove(self.user_info_path))
+    integration = await async_get_integration(hass, DOMAIN)
+    loggers: set[str] = {integration.pkg_path, *(integration.loggers or [])}
 
-    def write_user_info(self):
-        """Write user info to a file."""
-        with open(self.user_info_path, 'wt') as file:
-            file.write(json.dumps({
-                'id_token': self.id_token,
-                'access_token': self.access_token,
-                'refresh_token': self.refresh_token,
-            }, indent=4))
+    for logger_name in loggers:
+        logging.getLogger(logger_name).addHandler(handler)
 
-    @asyncio.coroutine
-    def async_start(self, _):
-        """Start the cloud component."""
-        success = yield from self._fetch_jwt_keyset()
-
-        # Fetching keyset can fail if internet is not up yet.
-        if not success:
-            self.hass.helpers.event.async_call_later(5, self.async_start)
-            return
-
-        def load_config():
-            """Load config."""
-            # Ensure config dir exists
-            path = self.hass.config.path(CONFIG_DIR)
-            if not os.path.isdir(path):
-                os.mkdir(path)
-
-            user_info = self.user_info_path
-            if not os.path.isfile(user_info):
-                return None
-
-            with open(user_info, 'rt') as file:
-                return json.loads(file.read())
-
-        info = yield from self.hass.async_add_job(load_config)
-
-        if info is None:
-            return
-
-        # Validate tokens
-        try:
-            for token in 'id_token', 'access_token':
-                self._decode_claims(info[token])
-        except ValueError as err:  # Raised when token is invalid
-            _LOGGER.warning("Found invalid token %s: %s", token, err)
-            return
-
-        self.id_token = info['id_token']
-        self.access_token = info['access_token']
-        self.refresh_token = info['refresh_token']
-
-        self.hass.add_job(self.iot.connect())
-
-    @asyncio.coroutine
-    def _fetch_jwt_keyset(self):
-        """Fetch the JWT keyset for the Cognito instance."""
-        session = async_get_clientsession(self.hass)
-        url = ("https://cognito-idp.us-east-1.amazonaws.com/"
-               "{}/.well-known/jwks.json".format(self.user_pool_id))
-
-        try:
-            with async_timeout.timeout(10, loop=self.hass.loop):
-                req = yield from session.get(url)
-                self.jwt_keyset = yield from req.json()
-
-            return True
-
-        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
-            _LOGGER.error("Error fetching Cognito keyset: %s", err)
-            return False
-
-    def _decode_claims(self, token):
-        """Decode the claims in a token."""
-        from jose import jwt, exceptions as jose_exceptions
-        try:
-            header = jwt.get_unverified_header(token)
-        except jose_exceptions.JWTError as err:
-            raise ValueError(str(err)) from None
-        kid = header.get('kid')
-
-        if kid is None:
-            raise ValueError("No kid in header")
-
-        # Locate the key for this kid
-        key = None
-        for key_dict in self.jwt_keyset['keys']:
-            if key_dict['kid'] == kid:
-                key = key_dict
-                break
-        if not key:
-            raise ValueError(
-                "Unable to locate kid ({}) in keyset".format(kid))
-
-        try:
-            return jwt.decode(
-                token, key, audience=self.cognito_client_id, options={
-                    'verify_exp': False,
-                })
-        except jose_exceptions.JWTError as err:
-            raise ValueError(str(err)) from None
+    return handler
